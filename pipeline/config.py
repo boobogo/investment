@@ -171,8 +171,12 @@ class WatchCfg(_Strict):
     macro: dict[str, str] = {"^VIX": "VIX", "ES=F": "S&P 500 futures", "NQ=F": "Nasdaq-100 futures"}
     poll_minutes: dict[Literal["regular", "extended", "closed"], float] = {"regular": 5, "extended": 10, "closed": 30}
     extended_fallback_minutes: float = 10
-    persist_seconds: float = 30
+    persist_seconds: float = 60
+    save_bars: bool = False
     bar_retention_days: int = 10
+    news_retention_days: int = Field(90, ge=1)
+    report_retention_days: int = Field(60, ge=1)
+    log_max_mb: float = Field(5, gt=0)
 
 
 class TimeWindow(_Strict):

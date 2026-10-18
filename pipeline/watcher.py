@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from pipeline import alerts, brain, clock, commands, config, detect, fetch, newsdesk, runner, storage, telegram
+from pipeline import alerts, brain, clock, commands, config, detect, fetch, newsdesk, runctl, runner, storage, telegram
 from pipeline.finnhub import Finnhub, FinnhubError, TradeStream
 from pipeline.live import LiveBook
 
@@ -54,6 +54,10 @@ def build_universe(watchlist: list[str], etfs: list[str], limit: int) -> Univers
 
 def session_kind(session: str) -> str:
     return {"regular": "regular", "pre": "extended", "post": "extended"}.get(session, "closed")
+
+
+def quote_key(row: dict) -> tuple:
+    return row["price"], row["prev_close"], row["day_change_pct"], row["session"]
 
 
 class Watcher:
@@ -86,6 +90,7 @@ class Watcher:
         self.fetch_macro = macro_fetcher or fetch_macro_quotes
         self.macro: dict[str, dict] = {}
         self.polled: dict[str, dict] = {}
+        self.saved_quotes: dict[str, tuple] = {}  # what live_quotes holds, to skip unchanged rows
         self.finnhub_session: tuple[float, str | None, bool] | None = None  # (checked at, session, holiday)
         self.reference_day = None  # New York date the daily reference data was loaded for
         self.daily: dict[str, object] = {}  # symbol -> daily OHLCV frame
@@ -230,18 +235,21 @@ class Watcher:
                 log.exception("saving live quotes failed")
 
     def persist(self) -> None:
+        """Changed quotes, finished bars (if kept) and the heartbeat, in one transaction.
+
+        The Pi runs from an SD card, so unchanged quotes are not rewritten: with the market
+        closed a cycle writes only the heartbeat.
+        """
         now_iso = storage.utcnow()
         session = self.session()
         rows = self.book.quote_rows(session, now_iso)
         rows += [{"symbol": s, "price": q["price"], "prev_close": q.get("prev_close"),
                   "day_change_pct": q.get("change_pct"), "session": session, "updated_at": now_iso}
                  for s, q in {**self.polled, **self.macro}.items()]  # fmt: skip
-        if rows:
-            storage.upsert_live_quotes(self.conn, rows)
-        bars = self.book.take_finished_bars(time.time())
-        if bars:
-            storage.save_bars(self.conn, bars, "stream")
-        storage.set_state(self.conn, "heartbeat", now_iso)
+        changed = [r for r in rows if self.saved_quotes.get(r["symbol"]) != quote_key(r)]
+        bars = self.book.take_finished_bars(time.time()) if self.cfg.save_bars else []
+        storage.save_live(self.conn, changed, bars, now_iso)
+        self.saved_quotes.update({r["symbol"]: quote_key(r) for r in changed})
 
     async def poll_loop(self) -> None:
         last_prune = 0.0
@@ -253,7 +261,7 @@ class Watcher:
             await asyncio.sleep(self.cfg.poll_minutes[session_kind(self.session())] * 60)
 
     async def poll_round(self, last_prune: float) -> float:
-        """Session, reference data, macro and overflow quotes, extended-hours fallback, daily pruning."""
+        """Session, reference data, macro and overflow quotes, extended-hours fallback, daily cleanup."""
         await self.refresh_session()
         session = self.session()
         await self.refresh_reference_data()
@@ -262,11 +270,21 @@ class Watcher:
         if session in ("pre", "post"):
             await self.extended_fallback(time.time())
         if time.time() - last_prune > 86400:
-            pruned = storage.prune_bars(self.conn, self.cfg.bar_retention_days)
+            self.housekeeping()
             last_prune = time.time()
-            if pruned:
-                log.info("pruned %d old 1-minute bars", pruned)
         return last_prune
+
+    def housekeeping(self) -> None:
+        """Once a day: delete old bars, headlines, reports and log lines, so the SD card never fills up."""
+        paths = self.settings.paths
+        bars = storage.prune_bars(self.conn, self.cfg.bar_retention_days)
+        news = storage.prune_news(self.conn, self.cfg.news_retention_days)
+        reports = runctl.prune_files(paths.reports, self.cfg.report_retention_days, keep={"latest.html"})
+        cap = int(self.cfg.log_max_mb * 1024 * 1024)
+        logs = [name for name in ("cron.log", "watchdog.log") if runctl.trim_log(paths.logs / name, cap, 1024 * 1024)]
+        if bars or news or reports or logs:
+            log.info("cleanup: %d old bars, %d old headlines, %d old report files deleted; trimmed %s",
+                     bars, news, reports, ", ".join(logs) or "no logs")  # fmt: skip
 
     # --- detection -------------------------------------------------------------------
 

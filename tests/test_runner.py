@@ -133,6 +133,18 @@ def test_dry_run_logs_packets_but_no_calls(settings):
     assert execute(settings, ok("AAPL", "MSFT"))[1].calls
 
 
+def test_live_quote_needs_a_running_watcher(settings):
+    conn = storage.connect(settings.paths.db)
+    old = "2026-01-01T00:00:00+00:00"
+    quote = {"symbol": "AAPL", "price": 250.0, "prev_close": 245.0, "day_change_pct": 2.04, "session": "regular",
+             "updated_at": old}  # fmt: skip
+    storage.save_live(conn, [quote], [], heartbeat=storage.utcnow())
+    # unchanged for a long time, but the watcher is alive: still the current price
+    assert runner._live_quote(conn, "AAPL") == {"px": 250.0, "chg_pct": 2.04, "session": "regular", "utc": "01-01 00:00"}
+    storage.save_live(conn, [], [], heartbeat=old)
+    assert runner._live_quote(conn, "AAPL") is None  # the watcher stopped
+
+
 def test_overlapping_run_is_refused(settings):
     with runctl.run_lock(settings.paths.db.parent / "run.lock"):
         code, backend = execute(settings, ok("AAPL", "MSFT"))

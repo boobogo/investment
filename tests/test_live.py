@@ -198,7 +198,15 @@ def test_watcher_session_prev_close_macro_and_persist(settings):  # noqa: F811
     assert quotes["AAPL"]["day_change_pct"] == pytest.approx(10.0)
     assert quotes["^VIX"]["day_change_pct"] == 25.0 and quotes["SPY"]["session"] == "regular"
     assert storage.get_state(w.conn, "heartbeat")
-    assert w.conn.execute("SELECT count(*) FROM bars_1m WHERE symbol = 'AAPL'").fetchone()[0] == 1  # the trade's bar
+    assert w.conn.execute("SELECT count(*) FROM bars_1m").fetchone()[0] == 0  # 1-minute bars are off by default
+    before = w.conn.total_changes
+    w.persist()
+    assert w.conn.total_changes - before == 1  # nothing changed: only the heartbeat is written
+    w.cfg.save_bars = True
+    w.book.on_trades([{"s": "AAPL", "p": aapl_close * 1.2, "t": (T0 + 180) * 1000, "v": 1}])
+    before = w.conn.total_changes
+    w.persist()
+    assert w.conn.total_changes - before == 1 + 2 + 1  # AAPL's quote, its two finished bars, the heartbeat
     assert {r["symbol"]: r["price"] for r in w.book.quote_rows("regular", "x")}["MSFT"] == 105.0  # seed quote shown
     assert "session regular" in w.status_line() and "^VIX 20.00 (+25.0%)" in w.status_line()
 
@@ -254,3 +262,36 @@ def test_stale_macro_quotes_are_not_acted_on(settings):  # noqa: F811
     assert [e for e in w.detect(now) if e.symbol == "NQ=F"] == []
     w.macro["NQ=F"]["time"] = now - timedelta(minutes=10)
     assert [e.symbol for e in w.detect(now) if e.symbol == "NQ=F"] == ["NQ=F"]
+
+
+def test_daily_cleanup_keeps_the_sd_card_from_filling(settings):  # noqa: F811
+    import os
+    from datetime import datetime, timedelta, timezone
+
+    from pipeline.news import NewsItem
+
+    w = make_watcher(settings)
+    now = datetime.now(timezone.utc)
+    items = [NewsItem(title=f"Headline {i}", source="Reuters", published=when, category="general",
+                      provider="finnhub", provider_id=str(i))
+             for i, when in enumerate([now - timedelta(days=100), now - timedelta(days=100), now])]  # fmt: skip
+    ids = storage.upsert_news(w.conn, items)
+    run = storage.start_run(w.conn, run_date="2026-07-01", slot="morning", mode="screened", args={})
+    storage.save_highlights(w.conn, run, [{"news_id": ids[id(items[0])], "title": "t", "why": "w", "scope": "market"}])
+
+    reports, logs = settings.paths.reports, settings.paths.logs
+    (reports / "dry-run").mkdir(parents=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    ninety_days_ago = (now - timedelta(days=90)).timestamp()
+    for name in ("2026-07-01-morning.html", "latest.html", "dry-run/packets-1.json", "2026-10-19-morning.html"):
+        (reports / name).write_text("x")
+        if "07-01" in name or name in ("latest.html", "dry-run/packets-1.json"):
+            os.utime(reports / name, (ninety_days_ago, ninety_days_ago))
+    (logs / "cron.log").write_bytes(b"old line\n" * 700_000 + b"last line\n")  # ~6 MB
+
+    w.housekeeping()
+    headlines = [r[0] for r in w.conn.execute("SELECT headline FROM news_items ORDER BY id")]
+    assert headlines == ["Headline 0", "Headline 2"]  # the old highlighted one stays
+    assert sorted(str(p.relative_to(reports)) for p in reports.rglob("*.*")) == ["2026-10-19-morning.html", "latest.html"]
+    cron = (logs / "cron.log").read_bytes()
+    assert len(cron) <= 1024 * 1024 and cron.endswith(b"last line\n") and cron.startswith(b"old line\n")

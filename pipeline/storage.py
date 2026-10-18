@@ -220,6 +220,9 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")  # the watcher and digest runs write concurrently
+    # with WAL this is still crash-safe (a power cut may lose the last commits, never corrupts);
+    # it flushes at checkpoints instead of on every commit, which spares the Pi's SD card
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     _migrate(conn)
@@ -457,13 +460,13 @@ def get_state(conn: sqlite3.Connection, key: str, default: str | None = None) ->
     return row["value"] if row else default
 
 
+SET_STATE = ("INSERT INTO watch_state VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value,"
+             " updated_at = excluded.updated_at")
+
+
 def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     with conn:
-        conn.execute(
-            "INSERT INTO watch_state VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value,"
-            " updated_at = excluded.updated_at",
-            (key, value, utcnow()),
-        )
+        conn.execute(SET_STATE, (key, value, utcnow()))
 
 
 # --- news store and digests ------------------------------------------------------
@@ -575,37 +578,53 @@ def held_alerts(conn: sqlite3.Connection, since: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def upsert_live_quotes(conn: sqlite3.Connection, rows: list[dict]) -> None:
-    """rows: {symbol, price, prev_close, day_change_pct, session, updated_at}"""
+def save_live(conn: sqlite3.Connection, quotes: list[dict], bars: list[tuple], heartbeat: str) -> None:
+    """One watcher cycle in one transaction (one write to the SD card instead of three).
+
+    quotes: {symbol, price, prev_close, day_change_pct, session, updated_at}, only the changed ones;
+    bars: (symbol, ts, open, high, low, close, volume) from the stream.
+    """
     with conn:
         conn.executemany(
             "INSERT INTO live_quotes VALUES (:symbol, :price, :prev_close, :day_change_pct, :session, :updated_at)"
             " ON CONFLICT (symbol) DO UPDATE SET price = excluded.price, prev_close = excluded.prev_close,"
             " day_change_pct = excluded.day_change_pct, session = excluded.session, updated_at = excluded.updated_at",
-            rows,
+            quotes,
         )
+        conn.executemany("INSERT OR REPLACE INTO bars_1m VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         [(*r, "stream") for r in bars])  # fmt: skip
+        conn.execute(SET_STATE, ("heartbeat", heartbeat, utcnow()))
 
 
-def live_quote(conn: sqlite3.Connection, symbol: str, max_age_s: float | None = None) -> dict | None:
+def live_quote(conn: sqlite3.Connection, symbol: str) -> dict | None:
+    """The watcher's latest quote; `updated_at` is when it last changed (see `watcher_alive`)."""
     row = conn.execute("SELECT * FROM live_quotes WHERE symbol = ?", (symbol,)).fetchone()
-    if row is None:
-        return None
-    if max_age_s is not None:
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["updated_at"])).total_seconds()
-        if age > max_age_s:
-            return None
-    return dict(row)
+    return dict(row) if row else None
 
 
-def save_bars(conn: sqlite3.Connection, rows: list[tuple], source: str) -> None:
-    """rows: (symbol, ts, open, high, low, close, volume)"""
-    with conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO bars_1m VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [(*r, source) for r in rows]
-        )
+def watcher_alive(conn: sqlite3.Connection, max_age_s: float) -> bool:
+    """Whether the watcher wrote its heartbeat recently (its quotes are current, even unchanged ones)."""
+    beat = get_state(conn, "heartbeat")
+    return bool(beat) and (datetime.now(timezone.utc) - datetime.fromisoformat(beat)).total_seconds() <= max_age_s
 
 
 def prune_bars(conn: sqlite3.Connection, keep_days: int) -> int:
     cutoff = int(datetime.now(timezone.utc).timestamp()) - keep_days * 86400
     with conn:
         return conn.execute("DELETE FROM bars_1m WHERE ts < ?", (cutoff,)).rowcount
+
+
+def prune_news(conn: sqlite3.Connection, keep_days: int) -> int:
+    """Delete headlines older than keep_days (ones a digest highlighted stay, the reports cite them).
+
+    SQLite reuses the freed space, so the file stops growing instead of shrinking (no VACUUM,
+    which would rewrite the whole file).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(timespec="seconds")
+    with conn:
+        n = conn.execute(
+            "DELETE FROM news_items WHERE published_at < ?"
+            " AND id NOT IN (SELECT news_id FROM digest_highlights WHERE news_id IS NOT NULL)",
+            (cutoff,),
+        ).rowcount
+        return n + conn.execute("DELETE FROM news_seen WHERE first_seen_at < ?", (cutoff,)).rowcount

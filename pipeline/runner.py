@@ -273,8 +273,10 @@ def _save_review(conn, run_id, prep: Prepared, outcome: brain.ReviewOutcome, to_
 
 
 def _live_quote(conn: sqlite3.Connection, symbol: str) -> dict | None:
-    """The watcher's live price for the packet, if it is fresh and from an open session."""
-    q = storage.live_quote(conn, symbol, max_age_s=180)
+    """The watcher's live price for the packet, if the watcher is running and the session is open."""
+    if not storage.watcher_alive(conn, max_age_s=180):
+        return None
+    q = storage.live_quote(conn, symbol)
     if not q or q.get("session") not in ("pre", "regular", "post") or q.get("day_change_pct") is None:
         return None
     return {"px": round(q["price"], 2), "chg_pct": round(q["day_change_pct"], 2), "session": q["session"],

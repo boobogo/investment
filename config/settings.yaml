@@ -130,12 +130,17 @@ watch:
     "NQ=F": Nasdaq-100 futures
   poll_minutes: {regular: 5, extended: 10, closed: 30}   # macro and overflow polling, by US session
   extended_fallback_minutes: 10  # pre/after-hours: if the stream is silent this long, read yfinance 5-min bars
-  persist_seconds: 30         # how often live quotes are written to the database
-  bar_retention_days: 10      # 1-minute bars kept for tuning and /why
+  persist_seconds: 60         # how often changed live quotes and the heartbeat are written (the Pi runs from an SD card)
+  save_bars: false            # also store 1-minute bars in bars_1m (nothing reads them yet; off to spare the SD card)
+  bar_retention_days: 10      # stored 1-minute bars are deleted after this many days
+  # daily cleanup by the watcher, so the SD card never fills up
+  news_retention_days: 90     # stored headlines (ones a digest highlighted are kept)
+  report_retention_days: 60   # HTML reports and dry-run packets (latest.html is kept)
+  log_max_mb: 5               # cron.log / watchdog.log are cut to their last 1 MB above this (pipeline.log rotates daily, 30 days)
 
 alerts:
   # Instant price alerts from the watcher. Aim: "only serious", about 0-3 a day.
-  mode: shadow                # shadow = log what would be sent; live = send to Telegram
+  mode: live                  # shadow = log what would be sent; live = send to Telegram
   check_seconds: 30
   # Stocks and sector ETFs: thresholds scale with each symbol's own volatility
   stock_window_minutes: 15

@@ -19,6 +19,34 @@ class AlreadyRunning(Exception):
     pass
 
 
+def prune_files(folder: Path, keep_days: float, keep: set[str]) -> int:
+    """Delete files under `folder` older than keep_days (by modification time), except names in `keep`."""
+    cutoff = datetime.now().timestamp() - keep_days * 86400
+    removed = 0
+    for f in folder.rglob("*"):
+        if f.is_file() and f.name not in keep and f.stat().st_mtime < cutoff:
+            f.unlink()
+            removed += 1
+    return removed
+
+
+def trim_log(path: Path, max_bytes: int, keep_bytes: int) -> bool:
+    """Cut an append-only log down to its last keep_bytes once it is over max_bytes.
+
+    Rewritten in place (not replaced), so a process appending to it keeps writing to the same file.
+    """
+    if not path.exists() or path.stat().st_size <= max_bytes:
+        return False
+    with path.open("rb") as f:
+        f.seek(-keep_bytes, os.SEEK_END)
+        tail = f.read()
+    tail = tail[tail.find(b"\n") + 1 :]  # start at a whole line
+    with path.open("r+b") as f:
+        f.write(tail)
+        f.truncate()
+    return True
+
+
 @contextmanager
 def run_lock(path: Path):
     """Exclusive, non-blocking lock so two runs never overlap (released even if the process dies)."""

@@ -110,7 +110,9 @@ Deployed at `boobogo@192.168.0.55:~/investment` as the systemd service `market-w
 - one alert per situation (60-minute cooldown, day-level moves once a day, unless the move grows 1.5x); quiet hours **23:00-07:00 Prague** hold everything except critical alerts (held alerts appear in the next digest); at most 6 alerts a day
 - after a price alert the watcher looks for the cause at +5, +15, +30, +60 minutes and replies under the alert
 
-**Shadow mode:** with `alerts.mode: shadow` (the current setting) alerts are only recorded, not sent; digests and command replies still arrive. Check what would have been sent with `uv run main.py alerts`, then switch to `alerts.mode: live` and redeploy.
+**Alert mode:** `alerts.mode: live` (the current setting) sends alerts to Telegram. With `shadow` they are only recorded, not sent (digests and command replies still arrive); `uv run main.py alerts` lists both.
+
+**SD card:** the watcher writes changed prices once a minute in one transaction, and once a day deletes headlines older than 90 days (digest highlights stay), reports older than 60 days, and trims `cron.log` / `watchdog.log` above 5 MB (`watch:` in `settings.yaml`). On the Pi the system journal is capped at 200 MB (`/etc/systemd/journald.conf.d/size.conf`).
 
 **Telegram commands** (only your chat is answered): `/status`, `/mute 2h`, `/unmute`, `/digest`, `/why NVDA`, `/news NVDA`, `/news`, `/alerts`, `/report`, `/watchlist`, `/help`.
 
@@ -184,7 +186,7 @@ Everything lives in `data/market.db` (SQLite):
 | `news_items` | every headline the watcher and digests fetched, with Claude's triage when judged |
 | `digest_highlights` | the news highlights Claude picked for each digest |
 | `price_events`, `alerts` | everything the detectors found, and every alert sent, held, shadow-recorded or failed (with Telegram message ids) |
-| `live_quotes`, `bars_1m` | the watcher's latest prices and 10 days of 1-minute bars |
+| `live_quotes`, `bars_1m` | the watcher's latest prices (written once a minute, only when changed); 1-minute bars only with `watch.save_bars: true` |
 | `watch_state` | watcher state: heartbeat, mute, alert memory, Telegram offset |
 
 Logs: `logs/pipeline.log` (rotated daily, 30 days) and `logs/cron.log` (scheduled runs).

@@ -1,8 +1,8 @@
 """Live prices: trades from the stream become 1-minute bars per symbol, in memory.
 
 The detectors read windows from here (e.g. the change over the last 15
-minutes); quotes are copied to the live_quotes table every few seconds and
-finished bars to bars_1m, so other processes (digests, /why) can see them.
+minutes); the watcher copies changed quotes to the live_quotes table every
+minute, so other processes (digests, /why) can see them.
 """
 
 from __future__ import annotations
