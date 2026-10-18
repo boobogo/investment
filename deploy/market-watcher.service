@@ -1,0 +1,25 @@
+# systemd unit for the always-on market watcher on the Raspberry Pi.
+# Install:  sudo cp deploy/market-watcher.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now market-watcher
+# Logs:     journalctl -u market-watcher -f     (and logs/pipeline.log, logs/cron.log)
+[Unit]
+Description=Market watcher: live prices, alerts, news triage, Telegram commands and digests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=boobogo
+WorkingDirectory=/home/boobogo/investment
+# secrets: FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN
+EnvironmentFile=/home/boobogo/investment/.env
+Environment=TZ=Europe/Prague
+Environment=PATH=/home/boobogo/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/boobogo/.local/bin/uv run --frozen main.py watch
+# the watcher stops cleanly on SIGTERM (saves quotes, cancels its tasks)
+TimeoutStopSec=30
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

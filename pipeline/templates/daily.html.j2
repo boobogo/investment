@@ -1,0 +1,405 @@
+{% macro badge(verdict) -%}
+<span class="badge v-{{ verdict }}"><span class="glyph" aria-hidden="true">{{ glyph[verdict] }}</span>{{ verdict }}</span>
+{%- endmacro %}
+{% macro chips(items) -%}
+{% for s in items %}<span class="chip">{{ s }}</span>{% endfor %}
+{%- endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market Research {{ run.run_date }} {{ run.slot }}</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+  --bullish: #2a78d6; --bearish: #e34948; --neutral: #898781; --watch: #fab219;
+  --notice: #fff4dc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --bullish: #3987e5; --bearish: #e66767; --neutral: #898781; --watch: #fab219;
+    --notice: #2e2510;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+  --bullish: #3987e5; --bearish: #e66767; --neutral: #898781; --watch: #fab219;
+  --notice: #2e2510;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 36px 0 12px; }
+.sub, .muted { color: var(--ink-2); }
+.small { font-size: 0.85rem; }
+.disclaimer { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+.notice {
+  background: var(--notice); border: 1px solid var(--border); border-left: 4px solid var(--watch);
+  border-radius: 6px; padding: 10px 14px; margin-top: 16px;
+}
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface);
+  font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap;
+}
+.badge .glyph { font-size: 0.75rem; }
+.v-bullish .glyph { color: var(--bullish); }
+.v-bearish .glyph { color: var(--bearish); }
+.v-neutral .glyph { color: var(--neutral); }
+.v-watch .glyph { color: var(--watch); }
+.chip {
+  display: inline-block; padding: 0 7px; margin: 2px 4px 2px 0; border-radius: 4px;
+  background: var(--grid); color: var(--ink-2); font-size: 0.78rem; white-space: nowrap;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 480px), 1fr)); gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.ticker { font-weight: 700; font-size: 1.1rem; }
+.meta { color: var(--ink-2); font-size: 0.85rem; margin: 4px 0 8px; font-variant-numeric: tabular-nums; }
+.card ul { margin: 6px 0; padding-left: 18px; }
+.card li { margin: 2px 0; }
+.card dl { margin: 8px 0 0; }
+.card dt { font-weight: 600; font-size: 0.8rem; color: var(--ink-2); margin-top: 8px; text-transform: uppercase; letter-spacing: 0.03em; }
+.card dd { margin: 2px 0 0; }
+.card dd ul { margin: 0; }
+.prev { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+details summary { cursor: pointer; color: var(--ink-2); font-size: 0.9rem; margin-top: 8px; }
+.news li { font-size: 0.88rem; }
+.news .when { color: var(--muted); font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--grid); text-align: left; vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+th { color: var(--ink-2); font-weight: 600; white-space: nowrap; position: sticky; top: 0; background: var(--surface); }
+th[data-type] { cursor: pointer; user-select: none; }
+th[data-dir="asc"]::after { content: " ↑"; }
+th[data-dir="desc"]::after { content: " ↓"; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.dim { color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }
+.tile .value { font-size: 1.35rem; font-weight: 600; }
+.tile .label { color: var(--ink-2); font-size: 0.8rem; }
+.neutral-list li { margin: 4px 0; }
+footer { color: var(--muted); font-size: 0.8rem; margin-top: 40px; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Market research · {{ run.run_date }} {{ run.slot }}</h1>
+  <div class="sub">
+    Based on the {{ run.as_of }} US close · run #{{ run.id }} · status {{ run.status }}
+    {% if run.model %} · {{ run.model }}{% if run.effort %} ({{ run.effort }} effort){% endif %}{% endif %}
+  </div>
+  <div class="disclaimer">Research notes for a closer look, not trade signals. Horizon: about 20 trading days, relative to the benchmark.</div>
+  {% if run.stop_reason or pending %}
+  <div class="notice">
+    {% if run.stop_reason %}<strong>Stopped early:</strong> {{ run.stop_reason }}.{% endif %}
+    {% if pending %} Carried over to the next run: {{ pending | sort | join(", ") }}.{% endif %}
+  </div>
+  {% endif %}
+</header>
+
+{% if highlights or earnings or movers or held %}
+<section id="news">
+  {% if highlights %}
+  <h2>News highlights</h2>
+  {% if news_window %}<p class="muted small">Picked by the analyst model from news since {{ news_window.since[:16] | replace("T", " ") }} UTC.</p>{% endif %}
+  <div class="cards">
+  {% for h in highlights %}
+    <article class="card">
+      <div class="card-head">
+        <span class="ticker">{{ loop.index }}.</span>
+        <strong>{% if h.url %}<a href="{{ h.url }}" rel="noopener">{{ h.title }}</a>{% else %}{{ h.title }}{% endif %}</strong>
+      </div>
+      <div class="meta">{{ h.scope }}{% if h.tickers %} · {{ h.tickers | join(", ") }}{% endif %} · importance {{ h.importance }}{% if h.source %} · {{ h.source }}{% endif %}{% if h.published_at %} · {{ h.published_at[5:16] | replace("T", " ") }} UTC{% endif %}</div>
+      <div>{{ h.why }}</div>
+    </article>
+  {% endfor %}
+  </div>
+  {% endif %}
+  {% if earnings %}
+  <h2>Earnings</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Date</th><th>Ticker</th><th>When</th><th>Note</th></tr></thead>
+    <tbody>
+    {% for e in earnings %}
+      <tr><td>{{ e.date }}</td><td><strong>{{ e.symbol }}</strong></td><td>{{ e.when or "–" }}</td>
+          <td class="muted small">{% if e.yahoo_date %}Yahoo lists {{ e.yahoo_date }}; the sources disagree{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  {% if movers %}
+  <h2>Last week</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Ticker</th><th class="num">5-day return</th><th class="num">vs benchmark</th></tr></thead>
+    <tbody>
+    {% for m in movers %}
+      <tr><td><strong>{{ m.symbol }}</strong></td><td class="num">{{ m.ret_pct | pct }}</td><td class="num">{{ m.vs_bench_pct | pct }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  {% if held %}
+  <h2>Held back overnight ({{ held | length }})</h2>
+  <ul>{% for a in held %}<li><span class="muted small">{{ a.created_at[5:16] | replace("T", " ") }} UTC</span> {{ a.text | striptags }}</li>{% endfor %}</ul>
+  {% endif %}
+</section>
+{% endif %}
+
+<section id="flagged">
+  <h2>Flagged ({{ flagged | length }})</h2>
+  {% if not flagged %}
+  <p class="muted">No bullish, bearish or watch verdicts this run.</p>
+  {% else %}
+  <div class="cards">
+  {% for v in flagged %}
+    <article class="card">
+      <div class="card-head">
+        <span class="ticker">{{ v.ticker }}</span>
+        <span class="muted">{{ v.name }}</span>
+        {{ badge(v.verdict) }}
+        <span class="muted small">{{ v.confidence }} confidence</span>
+        {% if v.held %}<span class="chip">held</span>{% endif %}
+      </div>
+      <div class="meta">
+        ${{ v.price | num }} · {{ v.ret_1d | pct }} on the day
+        {% if v.earnings_in_days is not none %} · earnings in {{ v.earnings_in_days }}d{% endif %}
+        {% if v.signals %}<br>{{ chips(v.signals) }}{% endif %}
+      </div>
+      <ul>{% for r in v.key_reasons %}<li>{{ r }}</li>{% endfor %}</ul>
+      <dl>
+        <dt>Risks</dt>
+        <dd><ul>{% for r in v.risks %}<li>{{ r }}</li>{% endfor %}</ul></dd>
+        <dt>What would change my mind</dt>
+        <dd>{{ v.what_would_change_my_mind }}</dd>
+        {% if v.data_gaps %}
+        <dt>Data gaps</dt>
+        <dd class="muted small">{{ v.data_gaps | join("; ") }}</dd>
+        {% endif %}
+      </dl>
+      {% if v.news %}
+      <details>
+        <summary>Headlines ({{ v.news | length }})</summary>
+        <ul class="news">
+        {% for n in v.news %}<li><span class="when">{{ n.utc }} UTC</span> · {{ n.src }} · {{ n.title }}</li>{% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+      {% if v.previous %}
+      <div class="prev">Previously {{ v.previous.verdict }} ({{ v.previous.confidence }}) on {{ v.previous.as_of }}; price {{ v.previous.px_chg_pct | pct }} since.</div>
+      {% endif %}
+    </article>
+  {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section id="extremes">
+  <h2>At extremes ({{ extremes | length }})</h2>
+  {% if not extremes %}
+  <p class="muted">No ticker is at an extreme reading (RSI, distance from its 20-day mean, 52-week high or low, extended-hours move).</p>
+  {% else %}
+  <p class="muted small">Listed whether or not they were sent to the analyst this run; an extreme is sent again at most every few days while it lasts.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Ticker</th><th>Condition</th><th class="num">RSI</th><th class="num">z20</th><th class="num">Ext. hours</th><th>Latest verdict</th></tr></thead>
+    <tbody>
+    {% for e in extremes %}
+      <tr>
+        <td><strong>{{ e.ticker }}</strong><br><span class="muted small">{{ e.name }}</span></td>
+        <td>{{ chips(e.conditions) }}{% if not e.sent %}<br><span class="muted small">not sent this run</span>{% endif %}</td>
+        <td class="num">{{ e.rsi14 if e.rsi14 is not none else "–" }}</td>
+        <td class="num">{{ e.z20 if e.z20 is not none else "–" }}</td>
+        <td class="num">{% if e.ext %}{{ e.ext.chg_pct | pct }} <span class="muted small">{{ e.ext.session }}</span>{% else %}–{% endif %}</td>
+        <td>{% if e.verdict %}{{ badge(e.verdict) }} <span class="muted small">{{ e.confidence }}</span>{% else %}<span class="muted">–</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+
+<section id="changed">
+  <h2>Changed since last review ({{ changed | length }})</h2>
+  {% if first_reviews %}
+  <p class="muted small">First review (nothing to compare with yet): {{ first_reviews | join(", ") }}.</p>
+  {% endif %}
+  {% if not changed %}
+  <p class="muted">{% if first_reviews | length < run.n_verdicts %}Every other verdict matches the previous one for that ticker.{% endif %}</p>
+  {% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Ticker</th><th>Before</th><th>Now</th><th class="num">Price since</th></tr></thead>
+    <tbody>
+    {% for v in changed %}
+      <tr>
+        <td><strong>{{ v.ticker }}</strong></td>
+        <td>{{ badge(v.previous.verdict) }} <span class="muted small">{{ v.previous.confidence }}, {{ v.previous.as_of }}</span></td>
+        <td>{{ badge(v.verdict) }} <span class="muted small">{{ v.confidence }}</span></td>
+        <td class="num">{{ v.previous.px_chg_pct | pct }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+
+{% if neutral %}
+<section id="neutral">
+  <h2>Neutral ({{ neutral | length }})</h2>
+  <details>
+    <summary>Show the main reason for each</summary>
+    <ul class="neutral-list">
+    {% for v in neutral %}<li><strong>{{ v.ticker }}</strong> <span class="muted small">{{ v.confidence }}</span>: {{ v.key_reasons[0] }}</li>{% endfor %}
+    </ul>
+  </details>
+</section>
+{% endif %}
+
+<section id="all">
+  <h2>All tickers ({{ table | length }})</h2>
+  <p class="muted small">Click a column to sort. Verdict is the latest one, from this run or an earlier review (date shown).</p>
+  <div class="table-wrap"><table class="sortable">
+    <thead><tr>
+      <th data-type="text">Ticker</th>
+      <th data-type="text">Verdict</th>
+      <th class="num" data-type="num">Price</th>
+      <th class="num" data-type="num">1d</th>
+      <th class="num" data-type="num">5d</th>
+      <th class="num" data-type="num">20d</th>
+      <th class="num" data-type="num">20d vs bench</th>
+      <th class="num" data-type="num">vs SMA200</th>
+      <th class="num" data-type="num">RSI</th>
+      <th class="num" data-type="num">z20</th>
+      <th class="num" data-type="num">ATR</th>
+      <th class="num" data-type="num">Earnings</th>
+      <th data-type="text">Signals</th>
+    </tr></thead>
+    <tbody>
+    {% for r in table %}
+      <tr>
+        <td><strong>{{ r.ticker }}</strong>{% if r.held %} <span class="chip">held</span>{% endif %}<br><span class="muted small">{{ r.name }}</span></td>
+        <td data-v="{{ r.verdict or 'zz' }}">
+          {% if r.verdict %}{{ badge(r.verdict) }}<br><span class="muted small">{{ r.confidence }}{% if not r.verdict_is_new %}, {{ r.verdict_as_of }}{% endif %}</span>{% else %}<span class="muted">–</span>{% endif %}
+        </td>
+        <td class="num" data-v="{{ r.px if r.px is not none else '' }}">{{ r.px | num }}</td>
+        {% for key in ["ret_1d", "ret_5d", "ret_20d", "ret_20d_vs_bench", "px_vs_sma200"] %}
+        <td class="num" data-v="{{ r[key] if r[key] is not none else '' }}">{{ r[key] | pct }}</td>
+        {% endfor %}
+        <td class="num" data-v="{{ r.rsi14 if r.rsi14 is not none else '' }}">{{ r.rsi14 if r.rsi14 is not none else "–" }}</td>
+        <td class="num" data-v="{{ r.z20 if r.z20 is not none else '' }}">{{ r.z20 if r.z20 is not none else "–" }}</td>
+        <td class="num" data-v="{{ r.atr_pct if r.atr_pct is not none else '' }}">{{ r.atr_pct | pct(1, false) }}</td>
+        <td class="num" data-v="{{ r.earnings_in_days if r.earnings_in_days is not none else '' }}">{% if r.earnings_in_days is not none %}{{ r.earnings_in_days }}d{% else %}–{% endif %}</td>
+        <td>{{ chips(r.signals) }}{% if not r.sent %}<span class="muted small">not sent</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+{% if track %}
+<section id="track">
+  <h2>Track record ({{ track.horizon }} trading days)</h2>
+  {% if not track.rows %}
+  <p class="muted">No verdict is {{ track.horizon }} trading days old yet{% if track.first_maturity %}; the first one can be scored around {{ track.first_maturity }}{% endif %}.</p>
+  {% else %}
+  <p class="muted small">Every logged verdict scored against the stock's return minus {{ track.benchmark }}'s over the next {{ track.horizon }} trading days. Bullish is right if it beat {{ track.benchmark }}, bearish if it lagged, neutral if it stayed within half its usual range, watch if it moved more than its usual range. Groups under {{ track.min_sample }} are too small to judge.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th class="num">Scored</th><th class="num">Right</th><th class="num">Avg vs {{ track.benchmark }}</th></tr></thead>
+    <tbody>
+    {% for r in track.rows %}
+      <tr>
+        <td>{% if r.verdict %}{{ badge(r.verdict) }}{% else %}{{ r.label }}{% endif %}</td>
+        <td class="num">{{ r.n | int }}{% if r.n < track.min_sample %} <span class="muted small">(too few)</span>{% endif %}</td>
+        <td class="num">{{ "%.0f%%" | format(r.hit_rate * 100) }}</td>
+        <td class="num">{{ r.avg_excess | pct(2) if r.avg_excess is not none else "–" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+{% endif %}
+
+<section id="run">
+  <h2>Run</h2>
+  <div class="tiles">
+    <div class="tile"><div class="value">{{ run.n_tickers or 0 }}</div><div class="label">tickers screened</div></div>
+    <div class="tile"><div class="value">{{ run.n_sent or 0 }}</div><div class="label">sent to the analyst</div></div>
+    <div class="tile"><div class="value">{{ run.n_verdicts or 0 }}</div><div class="label">verdicts</div></div>
+    <div class="tile"><div class="value">{{ calls | length }}</div><div class="label">model calls</div></div>
+    <div class="tile"><div class="value">{{ "{:,}".format(prompt_tokens) }}</div><div class="label">prompt tokens</div></div>
+    <div class="tile"><div class="value">{{ "{:,}".format(run.output_tokens or 0) }}</div><div class="label">output tokens</div></div>
+    <div class="tile"><div class="value">${{ "%.3f" | format(run.cost_usd or 0) }}</div><div class="label">API-equivalent cost</div></div>
+    <div class="tile"><div class="value">{% if duration_s is not none %}{{ duration_s }}s{% else %}–{% endif %}</div><div class="label">duration</div></div>
+  </div>
+  {% if calls %}
+  <details>
+    <summary>Model calls</summary>
+    <div class="table-wrap" style="margin-top: 8px"><table>
+      <thead><tr><th>Batch</th><th>Attempt</th><th>Result</th><th class="num">Tickers</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Seconds</th></tr></thead>
+      <tbody>
+      {% for c in calls %}
+        <tr>
+          <td>{{ c.batch_no }}{% if c.reask %} (re-ask){% endif %}{% if c.web_search %} (web){% endif %}</td>
+          <td>{{ c.attempt }}</td>
+          <td>{% if c.ok %}ok{% else %}{{ c.error }}{% endif %}</td>
+          <td class="num">{{ c.n_tickers }}</td>
+          <td class="num">{{ "{:,}".format((c.input_tokens or 0) + (c.cache_write_tokens or 0) + (c.cache_read_tokens or 0)) }}</td>
+          <td class="num">{{ "{:,}".format(c.output_tokens or 0) }}</td>
+          <td class="num">{{ "%.1f" | format((c.duration_ms or 0) / 1000) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </details>
+  {% endif %}
+</section>
+
+<footer>Generated {{ generated_at }} from the run log (runs.id = {{ run.id }}).</footer>
+</main>
+<script>
+document.querySelectorAll("table.sortable th[data-type]").forEach((th) => {
+  th.addEventListener("click", () => {
+    const body = th.closest("table").tBodies[0];
+    const idx = [...th.parentNode.children].indexOf(th);
+    const dir = th.dataset.dir === "asc" ? "desc" : "asc";
+    th.parentNode.querySelectorAll("th").forEach((h) => delete h.dataset.dir);
+    th.dataset.dir = dir;
+    const numeric = th.dataset.type === "num";
+    const value = (row) => {
+      const cell = row.children[idx];
+      const raw = cell.dataset.v ?? cell.textContent.trim();
+      return numeric ? (raw === "" ? NaN : parseFloat(raw)) : raw.toLowerCase();
+    };
+    const sign = dir === "asc" ? 1 : -1;
+    [...body.rows]
+      .sort((a, b) => {
+        const x = value(a), y = value(b);
+        if (numeric && isNaN(x)) return 1;
+        if (numeric && isNaN(y)) return -1;
+        return (x < y ? -1 : x > y ? 1 : 0) * sign;
+      })
+      .forEach((row) => body.appendChild(row));
+  });
+});
+</script>
+</body>
+</html>

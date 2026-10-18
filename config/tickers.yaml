@@ -1,0 +1,23 @@
+# Universe. Fields:
+#   symbol      (required) Yahoo Finance symbol
+#   type        stock (only type supported for now)
+#   name        company name, used for news search (falls back to Yahoo's name)
+#   aliases     other names headlines use (matched as whole words, case-insensitive)
+#   news_exclude  headlines containing any of these words are dropped (for ambiguous names)
+#   sector      free text
+#   notes       anything you want the analyst to know (kept short; it goes into the packet)
+#   held        true if you hold a position
+#   cost_basis  your average entry price (optional, only used when held)
+
+tickers:
+  - {symbol: AAPL,  name: Apple,             sector: Technology}
+  - {symbol: MSFT,  name: Microsoft,         sector: Technology}
+  - {symbol: NVDA,  name: NVIDIA,            sector: Technology}
+  - {symbol: AMZN,  name: Amazon,            sector: Consumer Discretionary,
+     news_exclude: [rainforest, wildfire, fires, deforestation]}
+  - {symbol: GOOGL, name: Alphabet,          sector: Communication Services, aliases: [Google]}
+  - {symbol: JPM,   name: JPMorgan Chase,    sector: Financials, aliases: [JPMorgan, JPMorganChase, Dimon]}
+  - {symbol: XOM,   name: Exxon Mobil,       sector: Energy, aliases: [Exxon, ExxonMobil]}
+  - {symbol: JNJ,   name: Johnson & Johnson, sector: Health Care, aliases: [J&J]}
+  - {symbol: CAT,   name: Caterpillar,       sector: Industrials}
+  - {symbol: KO,    name: Coca-Cola,         sector: Consumer Staples}
