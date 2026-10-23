@@ -1,36 +1,21 @@
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import pytest
 
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-def load_csv(name: str) -> pd.DataFrame:
-    return pd.read_csv(FIXTURES / name, parse_dates=["date"], index_col="date")
+from pipeline.markets import Quote
 
 
-@pytest.fixture
-def aapl() -> pd.DataFrame:
-    return load_csv("aapl_daily.csv")
+def utc(s: str) -> datetime:
+    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
 
-@pytest.fixture
-def spy() -> pd.DataFrame:
-    return load_csv("spy_daily.csv")
+def bars(start: str, values, minutes: int = 5) -> pd.Series:
+    """5-minute closes from `start` (UTC), one per value."""
+    idx = pd.date_range(utc(start), periods=len(values), freq=f"{minutes}min")
+    return pd.Series([float(v) for v in values], index=idx)
 
 
-def make_ohlcv(closes, spread=2.0, volume=1_000_000) -> pd.DataFrame:
-    """Synthetic bars: high/low = close +/- spread/2, open = close."""
-    closes = pd.Series(closes, dtype=float)
-    idx = pd.bdate_range("2024-01-01", periods=len(closes))
-    return pd.DataFrame(
-        {
-            "open": closes.values,
-            "high": closes.values + spread / 2,
-            "low": closes.values - spread / 2,
-            "close": closes.values,
-            "volume": float(volume),
-        },
-        index=idx,
-    )
+def quote(symbol="ES=F", name="S&P 500 fut", group="US stocks", price=100.0, day=0.0, hour=0.0, sigma=1.0,
+          live=True, at="2026-10-23T14:00") -> Quote:  # fmt: skip
+    ref = price / (1 + day / 100) if day is not None else None
+    return Quote(symbol, name, group, price, utc(at) - timedelta(minutes=5), day, hour, ref, sigma, live)

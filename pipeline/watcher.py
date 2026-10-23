@@ -1,381 +1,303 @@
-"""The always-on watcher (`uv run main.py watch`).
+"""The always-on watcher (`uv run main.py watch`), run on the Raspberry Pi by systemd.
 
-One asyncio program. Blocking work (HTTP calls, yfinance) runs in worker
-threads so the price stream never stalls; SQLite is only touched from the
-event-loop thread (writes are small and quick).
-
-It keeps live prices (the Finnhub trade stream as 1-minute bars, previous closes,
-VIX and index futures from yfinance, a yfinance fallback when the stream is silent
-outside regular hours), knows the US session, and every few seconds runs the price
-detectors through the alert policy: alerts go to Telegram in live mode and are only
-recorded in shadow mode. The news desk (news polling, triage, follow-ups) runs
-alongside, the digests are scheduled from here, and Telegram commands are
-answered from here (commands always reply, also in shadow mode).
+One asyncio program with three loops:
+  - checks: every 15 minutes while European or US stock markets are open, every
+    30 minutes otherwise, download the instruments' recent prices and alert on
+    unusual moves (one Telegram message per check); a sent alert gets a Claude
+    explanation as a reply, within the daily Claude cap
+  - digests: at the scheduled times, Claude researches the news with web search
+    and the digest goes to Telegram
+  - commands: Telegram commands from the configured chat
+Blocking work (downloads, Claude, Telegram) runs in worker threads; the state
+file is only touched from the event-loop thread.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import signal
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-
-from pipeline import alerts, brain, clock, commands, config, detect, fetch, newsdesk, runctl, runner, storage, telegram
-from pipeline.finnhub import Finnhub, FinnhubError, TradeStream
-from pipeline.live import LiveBook
+from pipeline import alerts, brain, briefing, clock, commands, config, markets, telegram
+from pipeline.markets import Quote
+from pipeline.state import State
 
 log = logging.getLogger(__name__)
 
-CORE_ETFS = 2  # the first ETFs in settings (SPY, QQQ) always get a stream slot: market-wide moves depend on them
-# how recent a symbol's last trade must be for its price to count in a detector
-PRICE_MAX_AGE_S = {"regular": 15 * 60, "pre": 60 * 60, "post": 60 * 60}
-MACRO_MAX_AGE = timedelta(minutes=30)  # VIX and futures quotes older than this are not acted on
 DIGEST_GRACE = timedelta(hours=3)  # a digest missed while the watcher was down still runs this long after its time
-DIGEST_SLOTS = ("morning", "preopen", "weekly")
-FINNHUB_SESSIONS = {"pre-market": "pre", "regular": "regular", "post-market": "post"}
+DIGEST_RETRY = timedelta(minutes=10)
+CHECK_OFFSET_S = 30  # checks run just after the quarter-hour, when the bar that just closed is in
 
 
-@dataclass
-class Universe:
-    streamed: list[str]
-    polled: list[str] = field(default_factory=list)  # beyond the stream limit: polled with /quote
-
-
-def build_universe(watchlist: list[str], etfs: list[str], limit: int) -> Universe:
-    ordered = list(dict.fromkeys([*etfs[:CORE_ETFS], *watchlist, *etfs[CORE_ETFS:]]))
-    return Universe(ordered[:limit], ordered[limit:])
-
-
-def session_kind(session: str) -> str:
-    return {"regular": "regular", "pre": "extended", "post": "extended"}.get(session, "closed")
-
-
-def quote_key(row: dict) -> tuple:
-    return row["price"], row["prev_close"], row["day_change_pct"], row["session"]
+def make_telegram(cfg: config.TelegramCfg) -> telegram.Telegram | None:
+    try:
+        return telegram.Telegram.from_env(cfg)
+    except config.MissingSecret as e:
+        log.warning("telegram not configured (%s): messages are only logged", e)
+        return None
 
 
 class Watcher:
     def __init__(
-        self,
-        settings: config.Settings,
-        *,
-        shadow: bool = False,
-        finnhub: Finnhub | None = None,
-        stream_factory=TradeStream,
-        price_source=None,
-        macro_fetcher=None,
-        telegram_client=None,
-        backend_factory=brain.make_backend,
-        digest_command: list[str] | None = None,
-        why_runner=runner.execute,
-    ):
+        self, settings: config.Settings, *, shadow: bool = False, backend: brain.LLMBackend | None = None,
+        telegram_client: telegram.Telegram | None = None, state: State | None = None,
+        fetch_closes=markets.fetch_closes, fetch_sigmas=markets.fetch_sigmas,
+    ):  # fmt: skip
         self.settings = settings
-        self.cfg, self.acfg = settings.watch, settings.alerts
-        # alerts are only sent with `alerts.mode: live` and without --shadow
+        self.cfg, self.acfg, self.ccfg = settings.watch, settings.alerts, settings.claude
+        self.tz = settings.digests.timezone
         self.shadow = shadow or self.acfg.mode == "shadow"
-        self.conn = storage.connect(settings.paths.db)
-        self.fh = finnhub or Finnhub.from_env()
-        self.watchlist = config.load_tickers(settings.paths.tickers)
-        watchlist = [t.symbol for t in self.watchlist]
-        self.universe = build_universe(watchlist, self.cfg.etfs, self.cfg.stream_limit)
-        self.book = LiveBook(self.universe.streamed)
-        self.stream = stream_factory(self.fh.key, self.universe.streamed, self.book.on_trades)
-        self.prices = price_source or fetch.YFinanceSource(settings.data.history_period)
-        self.fetch_macro = macro_fetcher or fetch_macro_quotes
-        self.macro: dict[str, dict] = {}
-        self.polled: dict[str, dict] = {}
-        self.saved_quotes: dict[str, tuple] = {}  # what live_quotes holds, to skip unchanged rows
-        self.finnhub_session: tuple[float, str | None, bool] | None = None  # (checked at, session, holiday)
-        self.reference_day = None  # New York date the daily reference data was loaded for
-        self.daily: dict[str, object] = {}  # symbol -> daily OHLCV frame
-        self.norms: dict[str, detect.Norms] = {}  # symbol -> typical moves, for volatility-scaled thresholds
-        self.policy = alerts.AlertPolicy(self.acfg, self.conn)
+        self.state = state or State(settings.paths.state)
+        self.policy = alerts.Policy(self.acfg, self.state)
+        self.backend = backend or brain.make_backend(self.ccfg)
         self.telegram = telegram_client
-        if self.telegram is None:  # needed in shadow mode too: commands always reply
-            try:
-                self.telegram = telegram.Telegram.from_env(settings.telegram)
-            except config.MissingSecret as e:
-                log.error("%s: no Telegram commands, and alerts stay in shadow mode", e)
-                self.shadow = True
-        self.commands = commands.Commands(self)
-        self.digest_command = digest_command or [str(config.ROOT / "scripts" / "run_pipeline.sh")]
-        self.digest_proc: asyncio.subprocess.Process | None = None
+        self.fetch_closes, self.fetch_sigmas = fetch_closes, fetch_sigmas
+        self.names, self.groups = self.cfg.names(), self.cfg.groups()
+        self.quotes: list[Quote] = []
+        self.sigmas: dict[str, float] = {}
+        self.sigma_date: date | None = None
+        self.last_check: datetime | None = None
+        self.last_digest_error = ""
+        self.claude_lock = asyncio.Lock()
         self.digest_tries: dict[str, list[datetime]] = {}
-        self.why_runner, self.why_running = why_runner, set()
-        self.desk = None
-        if settings.news_watch.live:
-            self.desk = newsdesk.NewsDesk(
-                settings, self.conn, self.fh, watchlist=self.watchlist, policy=self.policy,
-                telegram_client=self.telegram, shadow=self.shadow, session_fn=self.session,
-                context_fn=self.market_context, backend_factory=backend_factory,
-            )  # fmt: skip
+        self.background: set[asyncio.Task] = set()  # keeps fire-and-forget tasks alive until done
         self.started = time.time()
+        self.commands = commands.Commands(self)
 
-    # --- session ---------------------------------------------------------------
+    # --- prices and alerts ---------------------------------------------------------------
 
-    def session(self, now: datetime | None = None) -> str:
-        """'pre' | 'regular' | 'post' | 'closed'. Finnhub's market status wins when fresh (it knows holidays
-        and early closes); otherwise the New York clock decides."""
-        now = now or datetime.now(timezone.utc)
-        if self.finnhub_session and time.time() - self.finnhub_session[0] < 20 * 60:
-            _, session, holiday = self.finnhub_session
-            return "closed" if holiday else FINNHUB_SESSIONS.get(session or "", "closed")
-        return clock.us_session(now)
+    def markets_open(self, now: datetime) -> bool:
+        return any(clock.in_window(now, w) for w in self.cfg.market_hours)
 
-    async def refresh_session(self) -> None:
-        try:
-            ms = await asyncio.to_thread(self.fh.market_status)
-            self.finnhub_session = (time.time(), ms.get("session"), bool(ms.get("holiday")))
-        except FinnhubError as e:
-            log.warning("market status unavailable (%s); using the New York clock", e)
+    def next_check(self, now: datetime) -> datetime:
+        """The next quarter- or half-hour mark (plus a few seconds), depending on whether markets are open."""
+        step = 60 * (self.cfg.check_minutes_open if self.markets_open(now) else self.cfg.check_minutes_closed)
+        ts = (now.timestamp() // step + 1) * step + CHECK_OFFSET_S
+        return datetime.fromtimestamp(ts, timezone.utc)
 
-    # --- previous closes and polled quotes -------------------------------------------
-
-    async def refresh_reference_data(self) -> None:
-        """Once per New York day: daily history for every watched symbol, previous closes, and seed quotes.
-
-        The previous close comes from our own daily history (the last completed session
-        before today in New York). Finnhub's /quote "pc" was seen to lag by a day over a
-        weekend, so it is only a fallback.
-        """
-        today = clock.ny_date(datetime.now(timezone.utc))
-        if self.reference_day == today:
-            return
-        symbols = self.universe.streamed + self.universe.polled
-        try:
-            await asyncio.to_thread(self._download_daily, symbols)
-        except Exception as e:
-            log.warning("daily history refresh failed (%s); using the cache", e)
-        from_cache = 0
-        for s in symbols:
-            df = storage.load_prices(self.conn, s)
-            self.daily[s] = df
-            before = df[df.index.date < today] if not df.empty else df
-            if not before.empty:
-                self.book.prev_close[s] = float(before["close"].iloc[-1])
-                from_cache += 1
-                norms = detect.norms_from_daily(before)
-                if norms:
-                    self.norms[s] = norms
-        for s in self.universe.streamed:
+    async def refresh_quotes(self, now: datetime) -> list[Quote]:
+        symbols = list(self.names)
+        today = now.astimezone(ZoneInfo(self.tz)).date()
+        if self.sigma_date != today:
             try:
-                q = await asyncio.to_thread(self.fh.quote, s)
-            except FinnhubError as e:
-                log.warning("%s: quote unavailable: %s", s, e)
-                continue
-            if q.get("c"):
-                self.book.seed[s] = float(q["c"])  # shown until the first trade; never used in move windows
-            if s not in self.book.prev_close and q.get("pc"):
-                self.book.prev_close[s] = float(q["pc"])
-        self.reference_day = today
-        log.info("reference data for %s: previous closes from daily history for %d/%d symbols",
-                 today, from_cache, len(symbols))  # fmt: skip
+                sigmas = await asyncio.to_thread(self.fetch_sigmas, symbols, self.cfg.sigma_days)
+                if sigmas:
+                    self.sigmas, self.sigma_date = sigmas, today
+                    log.info("typical daily moves: %s", ", ".join(f"{s} {v:.2f}%" for s, v in sigmas.items()))
+            except Exception:
+                log.exception("daily history download failed; keeping the previous typical moves")
+        closes = await asyncio.to_thread(self.fetch_closes, symbols)
+        self.quotes = markets.snapshot(closes, self.sigmas, self.names, self.groups, now,
+                                       timedelta(minutes=self.cfg.max_quote_age_minutes))  # fmt: skip
+        return self.quotes
 
-    def _download_daily(self, symbols: list[str]) -> None:
-        """Runs in a worker thread, so it uses its own database connection."""
-        conn = storage.connect(self.settings.paths.db)
+    async def check(self, now: datetime) -> dict | None:
+        """One price check; returns the alert record if one was made."""
         try:
-            fetch.refresh(conn, self.prices, symbols, self.settings.data.benchmark, 0,
-                          extended_hours=False, with_fundamentals=False)  # fmt: skip
+            quotes = await self.refresh_quotes(now)
         finally:
-            conn.close()
-
-    async def poll_overflow(self) -> None:
-        for s in self.universe.polled:
-            try:
-                q = await asyncio.to_thread(self.fh.quote, s)
-            except FinnhubError as e:
-                log.warning("%s: quote failed: %s", s, e)
-                continue
-            if q.get("c"):
-                self.polled[s] = {"price": float(q["c"]), "prev_close": q.get("pc"), "change_pct": q.get("dp")}
-
-    async def poll_macro(self) -> None:
-        try:
-            self.macro = await asyncio.to_thread(self.fetch_macro, list(self.cfg.macro))
-        except Exception as e:
-            log.warning("macro quotes unavailable: %s", e)
-
-    async def extended_fallback(self, now: float) -> None:
-        """Outside regular hours the stream can go quiet; fill silent tapes from yfinance 5-minute bars."""
-        silent = [s for s, tape in self.book.tapes.items()
-                  if tape.last_ts is None or now - tape.last_ts > self.cfg.extended_fallback_minutes * 60]  # fmt: skip
-        if not silent:
-            return
-        try:
-            bars = await asyncio.to_thread(self.prices.intraday, silent)
-        except Exception as e:
-            log.warning("extended-hours fallback failed: %s", e)
-            return
-        fed = 0
-        for s, df in bars.items():
-            tape = self.book.tapes[s]
-            for ts, row in df.iterrows():
-                end = ts.timestamp() + 299  # treat each 5-minute bar's close as a trade at the end of the bar
-                if tape.last_ts is None or end > tape.last_ts:
-                    tape.add(float(row["close"]), min(end, now), float(row["volume"] or 0))
-                    fed += 1
-        if fed:
-            log.info("extended-hours fallback: %d bars from yfinance for %d silent symbols", fed, len(bars))
-
-    # --- loops ----------------------------------------------------------------------
-
-    async def persist_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.persist_seconds)
-            try:
-                self.persist()
-            except Exception:
-                log.exception("saving live quotes failed")
-
-    def persist(self) -> None:
-        """Changed quotes, finished bars (if kept) and the heartbeat, in one transaction.
-
-        The Pi runs from an SD card, so unchanged quotes are not rewritten: with the market
-        closed a cycle writes only the heartbeat.
-        """
-        now_iso = storage.utcnow()
-        session = self.session()
-        rows = self.book.quote_rows(session, now_iso)
-        rows += [{"symbol": s, "price": q["price"], "prev_close": q.get("prev_close"),
-                  "day_change_pct": q.get("change_pct"), "session": session, "updated_at": now_iso}
-                 for s, q in {**self.polled, **self.macro}.items()]  # fmt: skip
-        changed = [r for r in rows if self.saved_quotes.get(r["symbol"]) != quote_key(r)]
-        bars = self.book.take_finished_bars(time.time()) if self.cfg.save_bars else []
-        storage.save_live(self.conn, changed, bars, now_iso)
-        self.saved_quotes.update({r["symbol"]: quote_key(r) for r in changed})
-
-    async def poll_loop(self) -> None:
-        last_prune = 0.0
-        while True:
-            try:
-                last_prune = await self.poll_round(last_prune)
-            except Exception:
-                log.exception("polling round failed")
-            await asyncio.sleep(self.cfg.poll_minutes[session_kind(self.session())] * 60)
-
-    async def poll_round(self, last_prune: float) -> float:
-        """Session, reference data, macro and overflow quotes, extended-hours fallback, daily cleanup."""
-        await self.refresh_session()
-        session = self.session()
-        await self.refresh_reference_data()
-        await self.poll_macro()
-        await self.poll_overflow()
-        if session in ("pre", "post"):
-            await self.extended_fallback(time.time())
-        if time.time() - last_prune > 86400:
-            self.housekeeping()
-            last_prune = time.time()
-        return last_prune
-
-    def housekeeping(self) -> None:
-        """Once a day: delete old bars, headlines, reports and log lines, so the SD card never fills up."""
-        paths = self.settings.paths
-        bars = storage.prune_bars(self.conn, self.cfg.bar_retention_days)
-        news = storage.prune_news(self.conn, self.cfg.news_retention_days)
-        reports = runctl.prune_files(paths.reports, self.cfg.report_retention_days, keep={"latest.html"})
-        cap = int(self.cfg.log_max_mb * 1024 * 1024)
-        logs = [name for name in ("cron.log", "watchdog.log") if runctl.trim_log(paths.logs / name, cap, 1024 * 1024)]
-        if bars or news or reports or logs:
-            log.info("cleanup: %d old bars, %d old headlines, %d old report files deleted; trimmed %s",
-                     bars, news, reports, ", ".join(logs) or "no logs")  # fmt: skip
-
-    # --- detection -------------------------------------------------------------------
-
-    def fresh_price(self, symbol: str, now: float, session: str) -> float | None:
-        """The symbol's last traded price if it is recent enough to act on (never the startup quote)."""
-        tape = self.book.tapes[symbol]
-        max_age = PRICE_MAX_AGE_S.get(session)
-        if max_age is None or tape.last_ts is None or now - tape.last_ts > max_age:
+            self.last_check = now
+            self.state.set("heartbeat", now.isoformat())
+        hits = self.policy.new_hits(alerts.find_hits(quotes, self.acfg), now)
+        if not hits:
+            log.info("check: %d instruments, %d trading, nothing unusual", len(quotes), sum(q.live for q in quotes))
             return None
-        return tape.last_price
+        decision = self.policy.gate(hits, now, shadow=self.shadow)
+        record = {"at": now.isoformat(), "status": "sent" if decision.status == "send" else decision.status,
+                  "reason": decision.reason, "lines": alerts.hit_lines(hits),
+                  "critical": any(h.critical for h in hits)}  # fmt: skip
+        log.info("alert %s%s: %s", record["status"], f" ({decision.reason})" if decision.reason else "",
+                 " | ".join(record["lines"]))  # fmt: skip
+        blocker = self.explain_blocker(now)
+        if decision.status == "send":
+            text = alerts.format_alert(hits, self.quotes, now, self.acfg)
+            text += "\n<i>🔎 Asking Claude what caused it…</i>" if blocker is None else f"\n<i>No Claude check: {blocker}.</i>"
+            record["message_id"] = await self.notify(text)
+            if record["message_id"] is None:
+                record["status"] = "failed"
+        self.policy.remember(hits, now)
+        self.state.append("alerts", record)
+        if record["status"] == "sent" and blocker is None:
+            self.spawn(self.explain(record, now))
+        return record
 
-    def detect(self, now: datetime) -> list[detect.Event]:
-        session, ts = self.session(now), now.timestamp()
-        events = []
-        for s in self.universe.streamed:
-            price = self.fresh_price(s, ts, session)
-            prev = self.book.prev_close.get(s)
-            day = (price / prev - 1) * 100 if price and prev else None
-            window = self.book.tapes[s].change_pct(self.acfg.stock_window_minutes, ts) if price else None
-            if s in self.acfg.index_symbols:
-                events += detect.index_events(s, session, price, window, day, self.acfg)
+    async def check_loop(self) -> None:
+        now = datetime.now(timezone.utc)
+        while True:
+            try:
+                await self.check(now)
+            except Exception:
+                log.exception("price check failed")
+            wake = self.next_check(datetime.now(timezone.utc))
+            await asyncio.sleep(max(1.0, (wake - datetime.now(timezone.utc)).total_seconds()))
+            now = datetime.now(timezone.utc)
+
+    # --- Claude: budget, calls, explanations ---------------------------------------------------
+
+    def day_start(self, now: datetime) -> datetime:
+        return clock.local_day_start(now, self.tz)
+
+    def calls_today(self, now: datetime) -> list[dict]:
+        return self.state.items_since("claude_calls", self.day_start(now))
+
+    def scheduled_today(self, now: datetime) -> int:
+        start = self.day_start(now)
+        end = start + timedelta(hours=24) - timedelta(seconds=1)  # a DST day is 23 or 25 hours; close enough here
+        return sum(len(clock.occurrences(e, start, end)) for e in self.settings.digests.scheduled().values())
+
+    def extra_left(self, now: datetime) -> int:
+        """Claude calls left today for explanations and /digest: the scheduled digests are reserved first."""
+        used = sum(1 for c in self.calls_today(now) if c["kind"] in ("explain", "manual"))
+        return max(0, self.ccfg.daily_calls - self.scheduled_today(now) - used)
+
+    def next_digest(self, now: datetime) -> tuple[str, datetime] | None:
+        upcoming = [(t, k) for k, e in self.settings.digests.scheduled().items() if (t := clock.next_occurrence(e, now))]
+        if not upcoming:
+            return None
+        t, k = min(upcoming)
+        return k, t
+
+    def explain_blocker(self, now: datetime) -> str | None:
+        """Why an alert should not get a Claude explanation now (None: go ahead)."""
+        nxt = self.next_digest(now)
+        if nxt and nxt[1] - now <= timedelta(minutes=self.ccfg.explain_skip_before_digest_minutes):
+            return f"the {nxt[0]} digest at {commands.local_time(nxt[1], self.tz, now)} covers it"
+        last = [c for c in self.calls_today(now) if c["kind"] == "explain"]
+        if last and now - datetime.fromisoformat(last[-1]["at"]) < timedelta(minutes=self.ccfg.explain_min_gap_minutes):
+            return f"one ran at {commands.local_time(datetime.fromisoformat(last[-1]['at']), self.tz, now)} (see above)"
+        if self.extra_left(now) <= 0:
+            return "today's Claude calls are used up; the next digest covers it"
+        return None
+
+    async def call_claude(self, kind: str, prompt: str, user: str, schema: dict, now: datetime) -> brain.LLMResult:
+        """One logical Claude call with web search (retries included), recorded for the daily cap."""
+        # counted before waiting for the lock: an alert 15 minutes later must already see this call
+        entry = {"at": now.isoformat(), "kind": kind, "ok": None}
+        self.state.append("claude_calls", entry)
+        async with self.claude_lock:
+            system = briefing.load_prompt(self.settings.paths.prompts, prompt)
+            attempts = await asyncio.to_thread(brain.complete_with_retry, self.backend, system, user, schema,
+                                               self.ccfg, label=kind, web_search=True)  # fmt: skip
+        res = attempts[-1]
+        entry.update(ok=res.ok, error=res.error, seconds=round(res.duration_ms / 1000),
+                     turns=res.usage.get("turns"), output_tokens=res.usage.get("output_tokens"))  # fmt: skip
+        self.state.save()
+        log.info("claude %s: %s in %ds, %s turns", kind, "ok" if res.ok else f"FAILED ({res.error})",
+                 res.duration_ms // 1000, res.usage.get("turns"))  # fmt: skip
+        return res
+
+    async def explain(self, record: dict, now: datetime) -> None:
+        user = briefing.explain_request(record["lines"], self.quotes, now, self.tz)
+        try:
+            res = await self.call_claude("explain", "explain", user, briefing.EXPLAIN_SCHEMA, now)
+            if res.ok:
+                record["explained"] = res.data.get("cause")
+                self.state.save()
+                text = briefing.render_explain(res.data)
             else:
-                events += detect.stock_events(s, session, price, window, day, self.norms.get(s), self.acfg)
-        for s, q in self.polled.items():
-            events += detect.stock_events(s, session, q["price"], None, q.get("change_pct"), self.norms.get(s), self.acfg)
-        fresh_macro = {s: q for s, q in self.macro.items() if q.get("time") and now - q["time"] <= MACRO_MAX_AGE}
-        events += detect.macro_events(fresh_macro, self.cfg.macro, session, self.acfg, clock.futures_open(now))
-        return events
+                text = f"⚠️ Claude couldn't explain this move: {telegram.esc((res.error or '')[:200])}"
+            await self.notify(text, reply_to=record.get("message_id"))
+        except Exception:
+            log.exception("explanation failed")
 
-    async def check(self, now: datetime | None = None) -> list[tuple[detect.Event, alerts.Decision]]:
-        now = now or datetime.now(timezone.utc)
-        handled = []
-        for e in self.detect(now):
-            decision = self.policy.decide(e, now, shadow=self.shadow)
-            if decision.status == "repeat":
-                continue
-            text = alerts.format_alert(e, now, self.acfg.quiet_hours.timezone, self.book.day_change_pct(e.symbol))
-            message_id = None
-            if decision.status == "send":
-                try:
-                    message_id = (await asyncio.to_thread(self.telegram.send, text))[0]
-                except telegram.TelegramError as err:
-                    decision = alerts.Decision("failed", str(err))
-            alert_id = alerts.record(self.conn, e, decision, text, now, message_id)
-            self.policy.remember(e, now)  # held and shadow too, so one situation is logged once
-            if self.desk and (message_id or decision.status == "shadow"):
-                self.desk.register(alert_id, e, message_id, now)  # look for news that explains it
-            log.info("alert %s%s: %s %s", decision.status, f" ({decision.reason})" if decision.reason else "",
-                     e.symbol, e.label)  # fmt: skip
-            handled.append((e, decision))
-        return handled
+    # --- digests ---------------------------------------------------------------------------
 
-    def market_context(self, tickers: list[str]) -> list[str]:
-        """Live numbers for the triage prompt: the indexes, VIX, and the tickers in question."""
+    def previous_digest(self, before: datetime) -> datetime | None:
+        times = [clock.last_occurrence(e, before - timedelta(seconds=1)) for e in self.settings.digests.scheduled().values()]
+        times = [t for t in times if t]
+        return max(times) if times else None
+
+    def window_moves(self, since: datetime | None, now: datetime) -> list[str]:
+        """The alerts since the previous digest, as lines for the digest request."""
         out = []
-        for s in [*self.acfg.index_symbols, *[t for t in tickers if t not in self.acfg.index_symbols]]:
-            change = self.book.day_change_pct(s) if s in self.book.tapes else (self.polled.get(s) or {}).get("change_pct")
-            if change is not None:
-                out.append(f"{s} {change:+.1f}% today")
-        vix = self.macro.get("^VIX")
-        if vix and vix.get("time") and datetime.now(timezone.utc) - vix["time"] <= MACRO_MAX_AGE:
-            out.append(f"VIX {vix['price']:.1f} ({vix['change_pct']:+.0f}%)")
+        for a in self.state.items_since("alerts", since or datetime.min.replace(tzinfo=timezone.utc)):
+            status = "held in quiet hours, not seen yet" if a["status"] == "held" else a["status"]
+            line = f"- {commands.local_time(datetime.fromisoformat(a['at']), self.tz, now)} ({status}): {'; '.join(a['lines'])}"
+            if a.get("explained"):
+                line += f" | Claude's explanation then: {a['explained']}"
+            out.append(line)
         return out
 
-    async def detect_loop(self) -> None:
+    async def digest(self, kind: str, now: datetime, since: datetime | None) -> bool:
+        """Research and send one digest; False if Claude failed (nothing is sent then)."""
+        quotes = self.quotes
+        try:
+            quotes = await self.refresh_quotes(now)
+        except Exception:
+            log.exception("prices for the digest failed; using the last check's")
+        user = briefing.digest_request(kind, now, since, quotes, self.window_moves(since, now),
+                                       self.settings.digests.follow, self.tz)  # fmt: skip
+        res = await self.call_claude(kind, "digest", user, briefing.DIGEST_SCHEMA, now)
+        if not res.ok:
+            self.last_digest_error = res.error or "unknown error"
+            return False
+        await self.notify(briefing.render_digest(kind, res.data, quotes, now, self.tz))
+        return True
+
+    async def run_due_digests(self, now: datetime) -> list[str]:
+        """Run every scheduled digest whose time has come (or passed within DIGEST_GRACE) and isn't done.
+
+        Two tries, 10 minutes apart; if both fail, the snapshot goes out with the error."""
+        ran = []
+        done = self.state.data.setdefault("digests_done", {})
+        for kind, entry in self.settings.digests.scheduled().items():
+            when = clock.last_occurrence(entry, now)
+            if when is None or now - when > DIGEST_GRACE or done.get(kind) == when.isoformat():
+                continue
+            tries = self.digest_tries.setdefault(f"{kind}:{when.isoformat()}", [])
+            if len(tries) >= 2 or (tries and now - tries[-1] < DIGEST_RETRY):
+                continue
+            tries.append(now)
+            ok = await self.digest(kind, now, self.previous_digest(when))
+            if ok or len(tries) >= 2:
+                if not ok:
+                    await self.notify(briefing.render_digest_failure(kind, self.last_digest_error, self.quotes, now, self.tz))
+                done[kind] = when.isoformat()
+                self.state.save()
+            ran.append(kind)
+        return ran
+
+    async def schedule_loop(self) -> None:
         while True:
-            await asyncio.sleep(self.acfg.check_seconds)
             try:
-                await self.check()
+                await self.run_due_digests(datetime.now(timezone.utc))
             except Exception:
-                log.exception("detector check failed")
+                log.exception("digest schedule check failed")
+            await asyncio.sleep(30)
 
-    # --- Telegram: notices, commands, documents --------------------------------------------
+    def start_manual_digest(self, now: datetime) -> bool:
+        if self.claude_lock.locked():
+            return False
+        self.spawn(self._manual_digest(now))
+        return True
 
-    async def notify(self, text: str, silent: bool = False) -> int | None:
-        """A system message or a command reply (not an alert: shadow mode doesn't apply)."""
+    def spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self.background.add(task)
+        task.add_done_callback(self.background.discard)
+
+    async def _manual_digest(self, now: datetime) -> None:
+        try:
+            if not await self.digest("manual", now, self.previous_digest(now)):
+                await self.notify(briefing.render_digest_failure("manual", self.last_digest_error, self.quotes, now, self.tz))
+        except Exception:
+            log.exception("manual digest failed")
+            await self.notify("⚠️ The digest failed; see the watcher log.")
+
+    # --- Telegram ----------------------------------------------------------------------------
+
+    async def notify(self, text: str, *, reply_to: int | None = None, silent: bool = False) -> int | None:
         if self.telegram is None:
-            log.info("telegram not configured: %s", text[:200])
+            log.info("telegram not configured; message: %s", text[:300])
             return None
         try:
-            return (await asyncio.to_thread(self.telegram.send, text, silent=silent))[0]
+            return (await asyncio.to_thread(self.telegram.send, text, reply_to=reply_to, silent=silent))[0]
         except telegram.TelegramError as e:
             log.warning("telegram: %s", e)
             return None
-
-    async def send_document(self, path, caption: str) -> None:
-        if self.telegram is not None:
-            try:
-                await asyncio.to_thread(self.telegram.send_document, path, caption)
-            except telegram.TelegramError as e:
-                log.warning("telegram: %s", e)
 
     async def handle_update(self, update: dict) -> None:
         msg = update.get("message") or {}
@@ -393,7 +315,7 @@ class Watcher:
     async def commands_loop(self) -> None:
         if self.telegram is None:
             return
-        offset = int(storage.get_state(self.conn, "tg_offset", "0")) or None
+        offset = self.state.get("tg_offset")
         while True:
             try:
                 updates = await asyncio.to_thread(self.telegram.get_updates, offset, 25)
@@ -403,208 +325,82 @@ class Watcher:
                 continue
             for u in updates:
                 offset = u["update_id"] + 1
-                storage.set_state(self.conn, "tg_offset", str(offset))
+                self.state.set("tg_offset", offset)
                 try:
                     await self.handle_update(u)
                 except Exception:
                     log.exception("command failed")
                     await self.notify("⚠️ That command failed; see the watcher log.")
 
-    # --- digests and /why ----------------------------------------------------------------
+    # --- reports for commands ------------------------------------------------------------------
 
-    async def launch_digest(self, slot: str, extra: list[str], reason: str) -> bool:
-        """Run the pipeline in its own process (the cron wrapper); False if one is already running."""
-        if self.digest_proc is not None and self.digest_proc.returncode is None:
-            return False
-        self.digest_proc = await asyncio.create_subprocess_exec(
-            *self.digest_command, slot, *extra,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )  # fmt: skip
-        log.info("digest %s started (%s), pid %d", slot, reason, self.digest_proc.pid)
-        asyncio.create_task(self._digest_done(self.digest_proc, slot))
-        return True
-
-    async def _digest_done(self, proc, slot: str) -> None:
-        code = await proc.wait()
-        log.info("digest %s finished with exit code %d", slot, code)
-        if code not in (runner.EXIT_OK, runner.EXIT_PARTIAL):
-            await self.notify(f"⚠️ The {slot} digest failed (exit {code}); details in logs/cron.log on the Pi.")
-
-    def holiday(self) -> bool:
-        return bool(self.finnhub_session and time.time() - self.finnhub_session[0] < 20 * 60 and self.finnhub_session[2])
-
-    async def run_due_digests(self, now: datetime) -> list[str]:
-        """Start any scheduled digest whose time has come (or passed within DIGEST_GRACE) and isn't done."""
-        started = []
-        for slot in DIGEST_SLOTS:
-            entry = getattr(self.settings.digests, slot)
-            when = clock.last_occurrence(entry, now)
-            if when is None or now - when > DIGEST_GRACE:
-                continue
-            if entry.trading_days_only and self.holiday():
-                continue
-            run_date = when.astimezone(ZoneInfo(self.settings.schedule.timezone)).date().isoformat()
-            if storage.slot_done(self.conn, run_date, slot):
-                continue
-            tries = self.digest_tries.setdefault(f"{slot}:{when.isoformat()}", [])
-            if len(tries) >= 2 or (tries and now - tries[-1] < timedelta(minutes=10)):
-                continue
-            if await self.launch_digest(slot, [], reason="schedule"):
-                tries.append(now)
-                started.append(slot)
-        return started
-
-    async def schedule_loop(self) -> None:
-        while True:
-            await asyncio.sleep(30)
-            try:
-                await self.run_due_digests(datetime.now(timezone.utc))
-            except Exception:
-                log.exception("digest schedule check failed")
-
-    def start_why(self, symbol: str) -> bool:
-        if symbol in self.why_running:
-            return False
-        self.why_running.add(symbol)
-        asyncio.create_task(self._why(symbol))
-        return True
-
-    async def _why(self, symbol: str) -> None:
-        try:
-            opts = runner.RunOptions(tickers=[symbol], full=True, deliver=False)
-            code = await asyncio.to_thread(self.why_runner, self.settings, opts)
-            if code == runner.EXIT_LOCKED:
-                await self.notify("A digest is being built right now; try /why again in a minute.")
-            else:
-                await self.notify(self.why_card(symbol))
-        except Exception:
-            log.exception("/why %s failed", symbol)
-            await self.notify(f"⚠️ /why {telegram.esc(symbol)} failed; see the watcher log.")
-        finally:
-            self.why_running.discard(symbol)
-
-    def why_card(self, symbol: str) -> str:
-        esc = telegram.esc
-        row = self.conn.execute(
-            "SELECT * FROM verdicts WHERE ticker = ? AND created_at >= ? ORDER BY id DESC LIMIT 1",
-            (symbol, (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")),
-        ).fetchone()
-        if row is None:
-            return f"⚠️ No verdict for {esc(symbol)} came back (usage limit or an error); see the watcher log."
-        glyph = {"bullish": "▲", "bearish": "▼", "neutral": "●", "watch": "◆"}[row["verdict"]]
-        price = self.book.price(symbol) if symbol in self.book.tapes else None
-        change = self.book.day_change_pct(symbol) if symbol in self.book.tapes else None
-        money = f" · ${price:,.2f}" + (f", {change:+.1f}% today" if change is not None else "") if price else ""
-        reasons = "\n".join(f"• {esc(r)}" for r in json.loads(row["key_reasons_json"]))
-        risks = "; ".join(esc(r) for r in json.loads(row["risks_json"]))
-        gaps = json.loads(row["data_gaps_json"])
-        return (f"🔍 <b>{esc(symbol)}</b> {glyph} {row['verdict']} ({row['confidence']}){money}\n{reasons}\n"
-                f"<b>Risks:</b> {risks}\n<b>Would change my mind:</b> {esc(row['what_would_change_my_mind'])}"
-                + (f"\n<i>Data gaps: {esc('; '.join(gaps))}</i>" if gaps else ""))  # fmt: skip
-
-    # --- reports for commands ------------------------------------------------------------
-
-    def next_digests(self, now: datetime) -> str:
-        tz = self.acfg.quiet_hours.timezone
-        upcoming = sorted((clock.next_occurrence(getattr(self.settings.digests, s), now), s) for s in DIGEST_SLOTS)
-        return " · ".join(f"{s} {commands.local_time(t, tz, now)}" for t, s in upcoming[:2])
+    def alerts_today(self, now: datetime) -> list[dict]:
+        return self.state.items_since("alerts", self.day_start(now))
 
     def status_report(self, now: datetime) -> str:
-        esc = telegram.esc
         up = timedelta(seconds=int(time.time() - self.started))
-        quiet = self.book.seconds_since_trade(time.time())
-        counts = alerts.counts_today(self.conn, now, self.acfg.quiet_hours.timezone)
-        mute = storage.get_state(self.conn, "mute_until")
-        muted = mute and now < datetime.fromisoformat(mute)
-        calls = storage.calls_since(self.conn, "triage", alerts.day_start(now, self.acfg.quiet_hours.timezone)
-                                    .isoformat(timespec="seconds"))  # fmt: skip
-        ny = now.astimezone(clock.NY).strftime("%H:%M")
-        lines = [
+        lt = lambda t: commands.local_time(t, self.tz, now)  # noqa: E731
+        check = (f"last check {lt(self.last_check)} ({len(self.quotes)} instruments, "
+                 f"{sum(q.live for q in self.quotes)} trading)" if self.last_check else "no check yet")  # fmt: skip
+        counts: dict[str, int] = {}
+        for a in self.alerts_today(now):
+            counts[a["status"]] = counts.get(a["status"], 0) + 1
+        mute = self.state.get("mute_until")
+        muted = f" · muted until {lt(datetime.fromisoformat(mute))}" if mute and now < datetime.fromisoformat(mute) else ""
+        nxt = self.next_digest(now)
+        return "\n".join([
             f"<b>Watcher</b> · up {up} · alerts {'shadow (not sent)' if self.shadow else 'LIVE'}",
-            f"Market: {self.session(now)} (New York {ny}) · stream {'up' if self.stream.connected else 'DOWN'}, "
-            f"{len(self.universe.streamed)} symbols, last trade "
-            + ("never" if quiet is None else f"{quiet:.0f}s ago"),
-            " · ".join(self.market_context([])) or "no live index quotes yet",
-            "Alerts today: " + (", ".join(f"{n} {s}" for s, n in counts.items()) or "none")
-            + (f" · muted until {commands.local_time(datetime.fromisoformat(mute), self.acfg.quiet_hours.timezone, now)}"
-               if muted else ""),
-            f"Claude triage calls today: {calls}/{self.settings.triage.max_calls_per_day}"
-            + (f" · {esc(self.desk.status())}" if self.desk else ""),
-            f"Next digests: {self.next_digests(now)}",
-        ]  # fmt: skip
+            f"Prices: {check} · next {lt(self.next_check(now))}"
+            + (" · markets open" if self.markets_open(now) else " · markets closed"),
+            "Alerts today: " + (", ".join(f"{n} {s}" for s, n in counts.items()) or "none") + muted,
+            f"Claude today: {len(self.calls_today(now))} call(s); {self.extra_left(now)} left for moves or /digest "
+            f"(cap {self.ccfg.daily_calls} a day, scheduled digests reserved)",
+            f"Next digest: {nxt[0]} {lt(nxt[1])}" if nxt else "No digests scheduled",
+        ])  # fmt: skip
+
+    def markets_report(self) -> str:
+        if not self.quotes:
+            return "No prices yet; the first check runs at startup."
+        lines = (telegram.esc(x) for x in briefing.snapshot_lines(self.quotes))
+        return "<b>Markets</b> <i>(24h change)</i>\n" + "\n".join(lines)
+
+    def alerts_report(self, now: datetime) -> str:
+        rows = self.alerts_today(now)
+        if not rows:
+            return "No alerts today."
+        lines = [f"<b>Alerts today ({len(rows)})</b>"]
+        for a in rows[-15:]:
+            note = f" ({a['reason']})" if a.get("reason") else ""
+            when = commands.local_time(datetime.fromisoformat(a["at"]), self.tz, now)
+            lines.append(telegram.esc(f"• {when} [{a['status']}{note}] {'; '.join(a['lines'])}"))
         return "\n".join(lines)
 
-    def watchlist_report(self) -> str:
-        esc = telegram.esc
-        lines = ["<b>Live prices</b>"]
-        for s in self.universe.streamed:
-            price, change = self.book.price(s), self.book.day_change_pct(s)
-            if price is not None:
-                lines.append(f"{esc(s)} ${price:,.2f}" + (f" ({change:+.1f}%)" if change is not None else ""))
-        for s, q in self.macro.items():
-            lines.append(f"{esc(alerts.display_name(s))} {q['price']:,.2f} ({q['change_pct']:+.1f}%)")
-        return "\n".join(lines) if len(lines) > 1 else "No prices yet; the watcher just started."
+    # --- lifecycle -------------------------------------------------------------------------------
 
     async def announce_start(self) -> None:
         """Say the watcher (re)started, at most once an hour (a crash loop must not spam)."""
-        last = storage.get_state(self.conn, "start_notice")
+        last = self.state.get("start_notice")
         now = datetime.now(timezone.utc)
         if last and now - datetime.fromisoformat(last) < timedelta(hours=1):
             return
-        storage.set_state(self.conn, "start_notice", now.isoformat())
+        self.state.set("start_notice", now.isoformat())
         await self.notify(f"✅ Market watcher started ({'alerts in shadow mode' if self.shadow else 'alerts LIVE'}). "
                           "Send /help for commands.", silent=True)  # fmt: skip
 
-    async def status_loop(self, every_s: float = 300) -> None:
-        while True:
-            await asyncio.sleep(every_s)
-            log.info(self.status_line())
-
-    def status_line(self) -> str:
-        now = time.time()
-        quiet = self.book.seconds_since_trade(now)
-        trades = sum(t.trades for t in self.book.tapes.values())
-        stamp = lambda q: "" if not q.get("time") else f" @{q['time'].astimezone(clock.NY):%a %H:%M} NY"  # noqa: E731
-        macro = ", ".join(f"{s} {q['price']:.2f} ({q['change_pct']:+.1f}%{stamp(q)})" for s, q in self.macro.items()
-                          if q.get("change_pct") is not None)  # fmt: skip
-        return (
-            f"status: session {self.session()}, stream {'up' if self.stream.connected else 'DOWN'} "
-            f"({len(self.universe.streamed)} symbols, {trades} trades, last "
-            f"{'never' if quiet is None else f'{quiet:.0f}s ago'})"
-            + (f", polled {len(self.universe.polled)}" if self.universe.polled else "")
-            + (f", {macro}" if macro else "")
-            + f", alerts today: {self.alerts_today()}"
-            + (f", {self.desk.status()}" if self.desk else "")
-            + (" [shadow]" if self.shadow else "")
-        )
-
-    def alerts_today(self) -> str:
-        counts = alerts.counts_today(self.conn, datetime.now(timezone.utc), self.acfg.quiet_hours.timezone)
-        return ", ".join(f"{n} {status}" for status, n in counts.items()) or "none"
-
     async def run(self, duration_s: float | None = None) -> None:
-        log.info("watcher starting%s: streaming %s%s", " (alerts in shadow mode)" if self.shadow else " (alerts LIVE)",
-                 ", ".join(self.universe.streamed),
-                 f"; polling {', '.join(self.universe.polled)}" if self.universe.polled else "")  # fmt: skip
+        log.info("watcher starting (alerts %s): %d instruments", "in shadow mode" if self.shadow else "LIVE", len(self.names))
         tasks = [
-            asyncio.create_task(self.stream.run(), name="stream"),
-            asyncio.create_task(self.poll_loop(), name="poll"),
-            asyncio.create_task(self.persist_loop(), name="persist"),
-            asyncio.create_task(self.status_loop(), name="status"),
-            asyncio.create_task(self.detect_loop(), name="detect"),
+            asyncio.create_task(self.check_loop(), name="checks"),
+            asyncio.create_task(self.schedule_loop(), name="digests"),
+            asyncio.create_task(self.commands_loop(), name="commands"),
         ]
-        if self.desk:
-            tasks += [asyncio.create_task(self.desk.poll_loop(), name="news"),
-                      asyncio.create_task(self.desk.triage_loop(), name="triage")]  # fmt: skip
-        tasks += [asyncio.create_task(self.commands_loop(), name="commands"),
-                  asyncio.create_task(self.schedule_loop(), name="schedule")]  # fmt: skip
         await self.announce_start()
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
         try:
-            waiters = [asyncio.create_task(stop.wait())] + tasks
+            waiters = [asyncio.create_task(stop.wait()), *tasks]
             if duration_s:
                 waiters.append(asyncio.create_task(asyncio.sleep(duration_s)))
             done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
@@ -615,49 +411,4 @@ class Watcher:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self.persist()
-            log.info(self.status_line())
             log.info("watcher stopped")
-
-
-def macro_quote(closes: pd.Series, futures: bool) -> dict | None:
-    """Last price, reference close and change from 5-minute closes (UTC index).
-
-    Futures: the reference is the last trade before the current session began
-    (sessions start 18:00 New York). Others (VIX): the last value of the previous
-    New York day. yfinance's quick quote was seen keeping Friday's previous close
-    after the Sunday reopen, so we derive both numbers from timestamped bars.
-    """
-    closes = closes.dropna()
-    if closes.empty:
-        return None
-    ny = closes.index.tz_convert(clock.NY)
-    last_ny = ny[-1]
-    if futures:
-        start_day = last_ny.date() if last_ny.hour >= 18 else last_ny.date() - timedelta(days=1)
-        start = datetime.combine(start_day, datetime.min.time().replace(hour=18), clock.NY)
-        before = closes[ny < start]
-    else:
-        before = closes[ny.date < last_ny.date()]
-    if before.empty:
-        return None
-    price, ref = float(closes.iloc[-1]), float(before.iloc[-1])
-    return {"price": price, "prev_close": ref, "change_pct": (price / ref - 1) * 100,
-            "time": closes.index[-1].to_pydatetime()}  # fmt: skip
-
-
-def fetch_macro_quotes(symbols: list[str]) -> dict[str, dict]:
-    """Index and futures quotes from yfinance 5-minute bars (not on Finnhub's free tier)."""
-    import yfinance as yf
-
-    raw = yf.download(symbols, period="5d", interval="5m", prepost=True, auto_adjust=False,
-                      group_by="ticker", progress=False, threads=True)  # fmt: skip
-    out = {}
-    for s in symbols:
-        if isinstance(raw.columns, pd.MultiIndex) and s in raw.columns.get_level_values(0):
-            closes = raw[s]["Close"]
-            closes.index = closes.index.tz_convert("UTC")
-            q = macro_quote(closes, futures=s.endswith("=F"))
-            if q:
-                out[s] = q
-    return out

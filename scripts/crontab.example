@@ -1,7 +1,0 @@
-# Market research pipeline. Install with `crontab -e` and paste these lines (fix the path if needed).
-# Times are the machine's local time: set it to Prague first (sudo timedatectl set-timezone Europe/Prague).
-# Mon-Fri mornings cover every US close from Friday to Thursday; Monday morning also does the weekly full review.
-#
-# m  h  dom mon dow  command
-30   7  *   *   1-5  /home/boobogo/coding/investment/scripts/run_pipeline.sh morning
-0    15 *   *   1-5  /home/boobogo/coding/investment/scripts/run_pipeline.sh preopen

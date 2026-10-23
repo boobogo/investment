@@ -1,4 +1,4 @@
-"""Telegram Bot API client: send messages and files, read commands.
+"""Telegram Bot API client: send messages, read commands.
 
 Messages use Telegram's HTML mode, so any text that comes from outside
 (headlines, model output) must go through `esc()`. The bot token is never
@@ -10,7 +10,6 @@ from __future__ import annotations
 import html
 import logging
 import time
-from pathlib import Path
 
 import requests
 
@@ -108,13 +107,6 @@ class Telegram:
                 data["allow_sending_without_reply"] = "true"
             ids.append(self._call("sendMessage", data=data)["message_id"])
         return ids
-
-    def send_document(self, path: Path, caption: str | None = None, *, silent: bool = True) -> int:
-        with open(path, "rb") as f:
-            data = {"chat_id": self.chat_id, "disable_notification": "true" if silent else "false"}
-            if caption:
-                data.update(caption=caption[:1024], parse_mode="HTML")
-            return self._call("sendDocument", data=data, files={"document": (path.name, f)}, timeout=60)["message_id"]
 
     def get_updates(self, offset: int | None, wait_s: int = 25) -> list[dict]:
         data = {"timeout": wait_s, "allowed_updates": '["message"]'}

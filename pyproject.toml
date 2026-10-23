@@ -1,24 +1,15 @@
 [project]
 name = "investment"
 version = "0.1.0"
-description = "Daily market research pipeline: Python computes, Claude reviews"
+description = "Market watcher: alerts on unusual moves in the main markets, and Claude-written news digests"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "feedparser>=6.0.14",
-    "jinja2>=3.1.6",
-    "numpy>=2.4.6",
     "pandas>=3.0.6",
     "pydantic>=2.14.1",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
-    "websockets>=17.2",
     "yfinance>=1.7.0",
-]
-
-[project.optional-dependencies]
-api = [
-    "anthropic>=1.15.0",
 ]
 
 [dependency-groups]

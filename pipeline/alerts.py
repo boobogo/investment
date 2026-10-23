@@ -1,137 +1,143 @@
-"""Alert policy: which detector events (and triaged news) reach Telegram, when, and how they read.
+"""Alert policy: which unusual moves reach Telegram, when, and how they read.
 
-In order: repeats are suppressed (cooldown for sudden moves, once a day for day-level
-moves, unless the move grows by escalation_factor), quiet hours and /mute hold
-non-critical alerts for the morning digest, a daily budget caps the noise, and
-shadow mode logs instead of sending. Every non-repeat event is recorded in
-price_events, and every decision except "repeat" in the alerts table.
+A move is unusual when it is several times the instrument's typical daily move
+(sigma), over the last 24 hours or within the last hour. In order: repeats are
+suppressed (the same instrument, window and direction alerts again only after
+repeat_hours, or sooner if the move grows by `escalation`), quiet hours and
+/mute hold everything except critical moves on critical_symbols, a daily budget
+caps the noise, and shadow mode records instead of sending. All hits of one
+check go out as one message.
 """
 
 from __future__ import annotations
 
-import json
-import logging
-import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from pipeline import clock, storage, telegram
+from pipeline import clock, telegram
 from pipeline.config import AlertsCfg
-from pipeline.detect import Event
+from pipeline.markets import Quote
+from pipeline.state import State
 
-log = logging.getLogger(__name__)
-
-STATE_KEY = "alert_memory"  # watch_state: last alert per event key, survives restarts
-ICONS = {"window": "⚡", "day": "⚡", "ext": "🌙", "index_window": "📉", "index_day": "📉", "vix": "⚠️", "futures": "🌙"}
+WINDOW_LABEL = {"hour": "in 1h", "day": "in 24h"}
 
 
-def day_start(now: datetime, tz: str) -> datetime:
-    """Local midnight of `now` in `tz`, in UTC (a "day" for budgets and counts is the user's local day)."""
-    zone = ZoneInfo(tz)
-    return datetime.combine(now.astimezone(zone).date(), datetime.min.time(), zone).astimezone(timezone.utc)
+@dataclass
+class Hit:
+    quote: Quote
+    window: str  # hour | day
+    move: float  # %
+    ratio: float  # |move| / typical daily move
+    critical: bool
+
+    @property
+    def key(self) -> str:
+        return f"{self.quote.symbol}:{self.window}:{'up' if self.move > 0 else 'down'}"
 
 
-def counts_today(conn: sqlite3.Connection, now: datetime, tz: str) -> dict[str, int]:
-    """Instant alerts (price and news) recorded today, by status."""
-    rows = conn.execute(
-        "SELECT status, count(*) FROM alerts WHERE kind IN ('price', 'news') AND created_at >= ? GROUP BY status",
-        (day_start(now, tz).isoformat(timespec="seconds"),),
-    )
-    return {status: n for status, n in rows}
+def find_hits(quotes: list[Quote], cfg: AlertsCfg) -> list[Hit]:
+    hits = []
+    for q in quotes:
+        if not q.live or not q.sigma:
+            continue
+        for window, move, need, critical in (
+            ("hour", q.hour, cfg.hour_sigma, cfg.critical_hour_sigma),
+            ("day", q.day, cfg.day_sigma, cfg.critical_day_sigma),
+        ):
+            if move is None:
+                continue
+            ratio = abs(move) / q.sigma
+            if ratio >= need:
+                hits.append(Hit(q, window, move, ratio, ratio >= critical and q.symbol in cfg.critical_symbols))
+    return hits
 
 
 @dataclass
 class Decision:
-    status: str  # repeat | held | shadow | send
+    status: str  # send | held | shadow
     reason: str = ""
 
 
-class AlertPolicy:
-    def __init__(self, cfg: AlertsCfg, conn: sqlite3.Connection):
-        self.cfg, self.conn = cfg, conn
-        self.memory: dict[str, dict] = json.loads(storage.get_state(conn, STATE_KEY, "{}"))
+class Policy:
+    def __init__(self, cfg: AlertsCfg, state: State):
+        self.cfg, self.state = cfg, state
 
-    def _local_day(self, now: datetime) -> str:
-        return now.astimezone(ZoneInfo(self.cfg.quiet_hours.timezone)).date().isoformat()
+    @property
+    def memory(self) -> dict:
+        return self.state.data.setdefault("alert_memory", {})
 
-    def is_repeat(self, e: Event, now: datetime) -> bool:
-        last = self.memory.get(e.key)
-        if e.kind == "day" and not last:
-            # the same move already reported after hours or pre-market (typically earnings): don't report it again
-            ext = self.memory.get(f"{e.symbol}:ext:{e.direction}")
-            if ext and now - datetime.fromisoformat(ext["at"]) < timedelta(hours=24):
-                return abs(e.move_pct) < self.cfg.escalation_factor * ext["move"]
+    def is_repeat(self, h: Hit, now: datetime) -> bool:
+        last = self.memory.get(h.key)
         if not last:
             return False
-        grew = abs(e.move_pct) >= self.cfg.escalation_factor * last["move"]
-        if e.level:  # change since the previous close: once per US trading day, unless it grows
-            return last["day"] == clock.ny_date(now).isoformat() and not grew
-        recent = now - datetime.fromisoformat(last["at"]) < timedelta(minutes=self.cfg.cooldown_minutes)
-        return recent and not grew
+        hours = self.cfg.repeat_hours_hour if h.window == "hour" else self.cfg.repeat_hours_day
+        recent = now - datetime.fromisoformat(last["at"]) < timedelta(hours=hours)
+        return recent and abs(h.move) < self.cfg.escalation * last["move"]
+
+    def new_hits(self, hits: list[Hit], now: datetime) -> list[Hit]:
+        return [h for h in hits if not self.is_repeat(h, now)]
 
     def sent_today(self, now: datetime) -> int:
-        """Alerts sent since local midnight (shadow alerts count too, so shadow numbers are realistic)."""
-        counts = counts_today(self.conn, now, self.cfg.quiet_hours.timezone)
-        return counts.get("sent", 0) + counts.get("shadow", 0)
+        since = clock.local_day_start(now, self.cfg.quiet_hours.timezone)
+        return sum(1 for a in self.state.items_since("alerts", since) if a["status"] in ("sent", "shadow"))
 
-    def decide(self, e: Event, now: datetime, *, shadow: bool) -> Decision:
-        if self.is_repeat(e, now):
-            return Decision("repeat")
-        return self.gate(e.severity, now, shadow=shadow)
-
-    def gate(self, severity: str, now: datetime, *, shadow: bool) -> Decision:
-        """Quiet hours, mute and the daily budget (shared by price and news alerts)."""
-        critical = severity == "critical"
-        q = self.cfg.quiet_hours
-        if not critical and clock.in_window(now, q.start, q.end, q.timezone):
+    def gate(self, hits: list[Hit], now: datetime, *, shadow: bool) -> Decision:
+        critical = any(h.critical for h in hits)
+        if not critical and clock.in_window(now, self.cfg.quiet_hours):
             return Decision("held", "quiet hours")
-        mute = storage.get_state(self.conn, "mute_until")
+        mute = self.state.get("mute_until")
         if not critical and mute and now < datetime.fromisoformat(mute):
             return Decision("held", "muted")
         if not critical and self.sent_today(now) >= self.cfg.daily_budget:
             return Decision("held", f"daily budget of {self.cfg.daily_budget} reached")
         return Decision("shadow" if shadow else "send")
 
-    def remember(self, e: Event, now: datetime) -> None:
-        self.memory[e.key] = {"at": now.isoformat(), "move": abs(e.move_pct), "day": clock.ny_date(now).isoformat()}
-        storage.set_state(self.conn, STATE_KEY, json.dumps(self.memory))
+    def remember(self, hits: list[Hit], now: datetime) -> None:
+        for h in hits:
+            self.memory[h.key] = {"at": now.isoformat(), "move": round(abs(h.move), 3)}
+        self.state.save()
 
 
-def display_name(symbol: str) -> str:
-    return {"^VIX": "VIX", "ES=F": "S&P 500 futures", "NQ=F": "Nasdaq-100 futures"}.get(symbol, symbol)
+def hit_lines(hits: list[Hit]) -> list[str]:
+    """One plain-text line per instrument, strongest first: 'Nasdaq 100 fut -2.1% in 1h, -3.4% in 24h ...'."""
+    by_symbol: dict[str, list[Hit]] = {}
+    for h in hits:
+        by_symbol.setdefault(h.quote.symbol, []).append(h)
+    groups = sorted(by_symbol.values(), key=lambda hs: -max(h.ratio for h in hs))
+    lines = []
+    for hs in groups:
+        q = hs[0].quote
+        hs = sorted(hs, key=lambda h: h.window != "hour")  # 1h first, then 24h
+        moves = ", ".join(q.change(h.move, WINDOW_LABEL[h.window]) for h in hs)
+        ratio = max(h.ratio for h in hs)
+        arrow = "📈" if hs[0].move > 0 else "📉"
+        lines.append(f"{arrow} {q.name} {moves} · at {q.level()} · {ratio:.1f}× a normal day")
+    return lines
 
 
-def format_alert(e: Event, now: datetime, tz: str, day_pct: float | None = None) -> str:
-    """Telegram HTML for one event; any outside text is escaped."""
+def context_line(quotes: list[Quote], symbols: list[str], skip: set[str]) -> str:
+    """The rest of the market at a glance, from the configured context symbols."""
+    by = {q.symbol: q for q in quotes}
+    parts = []
+    for s in symbols:
+        q = by.get(s)
+        if q is None or s in skip:
+            continue
+        parts.append(f"{q.name} {q.level()} ({q.change()})" if s == "^VIX" else f"{q.name} {q.change()}")
+    return " · ".join(parts)
+
+
+def format_alert(hits: list[Hit], quotes: list[Quote], now: datetime, cfg: AlertsCfg) -> str:
+    """Telegram HTML; every outside text is escaped."""
     esc = telegram.esc
-    local = now.astimezone(ZoneInfo(tz)).strftime("%H:%M")
-    icon = "🚨" if e.severity == "critical" else ICONS.get(e.kind, "⚡")
-    head = f"{icon} <b>{esc(display_name(e.symbol))}</b> {esc(e.label)}"
-    facts = []
-    if e.price is not None and e.kind not in ("vix",):
-        facts.append(f"${e.price:,.2f}" if not e.symbol.endswith("=F") else f"{e.price:,.2f}")
-    if day_pct is not None and e.kind in ("window", "index_window"):
-        facts.append(f"day {day_pct:+.1f}%")
-    facts.append(local)
-    tail = "\n<i>Market-wide drop: this one ignores quiet hours.</i>" if e.severity == "critical" else ""
-    return f"{head}\n{' · '.join(facts)}{tail}"
-
-
-def record(
-    conn: sqlite3.Connection, e: Event, decision: Decision, text: str, now: datetime, message_id: int | None = None
-) -> int:
-    """Store the event and the alert decision at the detection time; returns the alerts row id."""
-    at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO price_events (detected_at, symbol, kind, severity, move_pct, ratio, price, details_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (at, e.symbol, e.kind, e.severity, round(e.move_pct, 3),
-             None if e.ratio is None else round(e.ratio, 2), e.price, json.dumps({"label": e.label, "key": e.key})),
-        )  # fmt: skip
-    return storage.log_alert(
-        conn, created_at=at, kind="price", severity=e.severity, symbol=e.symbol, text=text,
-        status={"send": "sent"}.get(decision.status, decision.status), reason=decision.reason or None,
-        telegram_message_id=message_id, event_id=cur.lastrowid,
-    )  # fmt: skip
+    local = now.astimezone(ZoneInfo(cfg.quiet_hours.timezone)).strftime("%H:%M")
+    critical = any(h.critical for h in hits)
+    head = "🚨 <b>Market shock</b>" if critical else "⚡ <b>Unusual market move</b>"
+    lines = [f"{head} · {local}", *(esc(line) for line in hit_lines(hits))]
+    context = context_line(quotes, cfg.context, {h.quote.symbol for h in hits})
+    if context:
+        lines.append(f"<i>24h: {esc(context)}</i>")
+    if critical:
+        lines.append("<i>Very large move: this one comes through quiet hours.</i>")
+    return "\n".join(lines)

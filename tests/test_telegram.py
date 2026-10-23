@@ -71,12 +71,3 @@ def test_errors_never_contain_the_token():
     with pytest.raises(telegram.TelegramError, match="chat not found"):
         tg.send("x")
     assert len(tg.session.posts) == 1  # client errors are not retried
-
-
-def test_send_document(tmp_path):
-    f = tmp_path / "r.html"
-    f.write_text("<html></html>")
-    tg, _ = client(ok(11))
-    assert tg.send_document(f, caption="report") == 11
-    post = tg.session.posts[0]
-    assert post["url"].endswith("/sendDocument") and post["files"]["document"][0] == "r.html"

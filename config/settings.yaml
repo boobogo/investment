@@ -1,174 +1,88 @@
-# Pipeline settings. Relative paths resolve against the project root.
+# Market watcher settings. Relative paths resolve against the project root.
 
 paths:
-  db: data/market.db
-  logs: logs
-  reports: reports
-  prompt: prompts/analyst.md
-  tickers: config/tickers.yaml
+  state: data/state.json      # the watcher's small memory (no database; prices are never stored)
+  prompts: prompts
 
-data:
-  source: yfinance
-  history_period: 2y          # full window is re-downloaded each run (keeps split/dividend adjustment consistent)
-  benchmark: SPY
-  fundamentals_max_age_hours: 20   # morning fetch is reused by the afternoon run
-  extended_hours: true        # after-hours (morning run) / pre-market (afternoon run) prices
+watch:
+  # What the watcher checks for unusual moves: {group: {Yahoo Finance symbol: short name}}.
+  # Futures and currencies trade almost around the clock, so they also catch overnight news.
+  instruments:
+    US stocks:
+      ES=F: S&P 500 fut
+      NQ=F: Nasdaq 100 fut
+      YM=F: Dow (US30) fut
+      RTY=F: Russell 2000 fut
+      ^VIX: VIX
+    US sectors:
+      SMH: Chips (SMH)
+      XLF: Banks (XLF)
+      XLE: Energy (XLE)
+      XLV: Health care (XLV)
+    Rates and currencies:
+      ^TNX: US 10y yield
+      DX-Y.NYB: Dollar index
+      EURUSD=X: EUR/USD
+      JPY=X: USD/JPY
+    Commodities:
+      GC=F: Gold
+      CL=F: WTI oil
+      BZ=F: Brent oil
+    Europe:
+      ^STOXX50E: Euro Stoxx 50
+      ^GDAXI: DAX
+      ^FTSE: FTSE 100
+    Asia:
+      ^N225: Nikkei 225
+      ^HSI: Hang Seng
+      000001.SS: Shanghai
+      ^KS11: KOSPI
+    Crypto:
+      BTC-USD: Bitcoin
+  check_minutes_open: 15      # how often prices are checked while European or US stock markets are open ...
+  check_minutes_closed: 30    # ... and the rest of the time (nights, weekends)
+  market_hours:               # "open" above: Xetra and the New York Stock Exchange, weekdays
+    - {start: "09:00", end: "17:30", timezone: Europe/Berlin, days: [mon, tue, wed, thu, fri]}
+    - {start: "09:30", end: "16:00", timezone: America/New_York, days: [mon, tue, wed, thu, fri]}
+  max_quote_age_minutes: 45   # an instrument whose last price is older is closed now: shown, never alerted on
+  sigma_days: 250             # typical daily move = standard deviation of daily changes over this many sessions
 
-news:
-  lookback_hours: 72
-  fresh_hours: 24             # newer than this and not in an earlier run = "fresh news" trigger
-  max_items: 5
-  snippet_chars: 200
-  # two headlines are the same story if their titles are near-identical (similarity 0-1) ...
-  dedup_similarity: 0.85
-  # ... or share at least this many content words, covering this share of the shorter title
-  dedup_min_shared_words: 2
-  dedup_word_overlap: 0.4
-  timeout_s: 15
-  workers: 6                  # parallel feed downloads
-  # ranked above other outlets when choosing the top headlines (matched against the source name/domain)
-  preferred_sources: [Reuters, Bloomberg, Wall Street Journal, wsj.com, Financial Times, ft.com, CNBC,
-                      Barron's, barrons.com, MarketWatch, Associated Press, apnews.com, Business Wire,
-                      PR Newswire, GlobeNewswire]
-  blocked_sources: [Audacy]   # never used (matched against the source name/domain)
-  # headlines matching any of these regexes are dropped (listicles and videos carry little information)
-  skip_title_patterns:
-    - '^Watch\b'
-    - '(?i)interactive stock chart'
-    - '(?i)\b\d+\s+(?:\w+\s+){0,2}stocks?\b'
-    - "(?i)\\bI'd buy\\b"
-    - '(?i)\b(?:should you|better) buy\b'
-    - '(?i)\bvs\.? .* which\b'
-    # law-firm lawsuit ads dressed up as news ("Investors with losses have opportunity to join...")
-    - '(?i)(investors? with .* losses|opportunity to (join|lead)|urges? .*investors|shareholder alert|deadline alert|reminds? .*(investors|shareholders)|on behalf of (investors|shareholders)|class action (filed|lawsuit) .*(investors|shareholders))'
+alerts:
+  # A move is "unusual" when it is several times the instrument's typical daily move (sigma), so
+  # quiet instruments (S&P, EUR/USD) alert on smaller % moves than jumpy ones (oil, VIX, bitcoin).
+  mode: live                  # shadow = record what would be sent; live = send to Telegram
+  # Replaying Aug-Oct 2026 with these values: ~5 alerts a week (the Oct 22 AI sell-off, the Oct 15 Asia drop, oil spikes...)
+  day_sigma: 2.5              # over the last 24 hours: at least this many typical daily moves (S&P ~2%, oil ~8%)
+  hour_sigma: 2.0             # within the last hour: at least this many typical daily moves (S&P ~1.6%)
+  critical_day_sigma: 4.0     # this big on a critical symbol: comes through quiet hours and /mute (S&P ~3.2%)
+  critical_hour_sigma: 3.0    # (S&P ~2.4% within an hour)
+  critical_symbols: [ES=F, NQ=F, YM=F, RTY=F, ^VIX, CL=F, BZ=F, GC=F]
+  repeat_hours_day: 20        # the same instrument and direction alerts again only after this many hours ...
+  repeat_hours_hour: 3
+  escalation: 1.5             # ... or sooner if the move grows this many times bigger
+  context: [ES=F, NQ=F, ^VIX, CL=F, GC=F, BTC-USD]   # shown under each alert for the bigger picture
+  quiet_hours: {start: "23:00", end: "07:00", timezone: Europe/Prague}   # held alerts go into the morning digest
+  daily_budget: 6             # after this many alert messages in a (Prague) day, only critical ones go out
 
-llm:
-  backend: claude_cli         # claude_cli = Pro subscription via the `claude` CLI
-                              # api = Anthropic API (needs ANTHROPIC_API_KEY and `uv sync --extra api`)
+claude:
+  # Claude with web search writes the digests and explains big moves (the `claude` CLI on the Pro plan)
   model: claude-sonnet-5-5    # switch to claude-opus-5-5 here
-  effort: high                # low | medium | high | xhigh | max (how hard the model thinks)
-  batch_size: 15              # packets per call
-  timeout_s: 300
-  retries: 2                  # extra attempts after a transient failure ...
-  backoff_s: [30, 120]        # ... waiting this long before each one
-  web_search_max_uses: 3      # searches per web-enabled call (`run --web-search N`)
+  effort: high                # low | medium | high | xhigh | max
+  timeout_s: 600              # a call with web searches takes 1-4 minutes
+  retries: 1                  # one more attempt after a transient failure ...
+  backoff_s: [60]             # ... after waiting this long
+  daily_calls: 4              # all Claude calls in a (Prague) day; scheduled digests are reserved first,
+                              # so on weekdays 2 are left for explaining big moves (or /digest)
+  explain_min_gap_minutes: 120          # one explanation per burst: later alerts within this window don't call again
+  explain_skip_before_digest_minutes: 45   # a digest that is this close covers the move instead
 
-schedule:
-  timezone: Europe/Prague     # decides the run date that morning/afternoon slots belong to
-
-report:
-  delivery: telegram          # none | telegram | email (email is a stub); telegram needs TELEGRAM_* in .env
+digests:
+  # Each time is in its own time zone, so daylight-saving changes on either side need no edits.
+  morning: {time: "07:30", timezone: Europe/Prague, days: [mon, tue, wed, thu, fri]}     # US close, Asia, overnight
+  preopen: {time: "09:00", timezone: America/New_York, days: [mon, tue, wed, thu, fri]}  # Europe, US data, pre-market
+  weekly:  {time: "19:00", timezone: Europe/Prague, days: [sun]}                          # the week behind and ahead
+  follow: [AAPL, MSFT, NVDA, AMZN, GOOGL, JPM, XOM, JNJ, CAT, KO]   # stocks whose material news always makes the digest
+  timezone: Europe/Prague     # times in the digests are shown in this zone
 
 telegram:
   timeout_s: 20               # bot token and chat id come from .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-
-screen:
-  # Extremes: sent when a ticker enters the zone, then at most every state_repeat_days while it stays there
-  rsi_extreme_high: 80
-  rsi_extreme_low: 20
-  z20_extreme: 2.5            # close this many standard deviations from its 20-day mean (Bollinger-style)
-  new_52w_extremes: true      # a new 52-week high or low
-  # Events: sent once per market session
-  big_move_pct: 3.0           # a daily move must be at least this big ...
-  big_move_atr_mult: 1.5      # ... and at least this many times the stock's average daily range (ATR)
-  ext_move_pct: 3.0           # same rule for after-hours / pre-market moves vs the last close
-  volume_spike: 2.5           # volume vs its 20-day average
-  golden_death_cross: true    # SMA50 crossing SMA200
-  price_sma200_cross: true
-  macd_cross: false           # crosses every couple of weeks per stock: many extra sends
-  news_needs_move: true       # fresh news only triggers together with a move or volume spike
-  earnings_within_days: 5
-  held_review_days: 7         # held positions get reviewed at least this often
-  state_repeat_days: 3
-  full_review_weekday: 0      # weekday (0 = Monday) whose morning run reviews every ticker; null = never
-  max_sends: 30               # cap per screened run; the rest wait for the next run
-
-evaluate:
-  horizons: [5, 20, 60]       # trading days; 20 matches the analyst's horizon
-  neutral_band_sigma: 0.5     # "neutral" was right if the excess return stayed within this many sigma
-  watch_band_sigma: 1.0       # "watch" was right if the excess return moved more than this many sigma
-  vol_lookback_days: 60       # trading days used to estimate each stock's typical excess move (sigma)
-  min_sample: 30              # groups with fewer scored verdicts are marked too few to judge
-
-digests:
-  # each time is in its own time zone, so daylight-saving changes on either side need no edits
-  morning: {time: "07:30", timezone: Europe/Prague, days: [mon, tue, wed, thu, fri]}
-  preopen: {time: "09:00", timezone: America/New_York, days: [mon, tue, wed, thu, fri], trading_days_only: true}
-  weekly:  {time: "19:00", timezone: Europe/Prague, days: [sun]}
-  highlights: 8               # news highlights per digest (the model may pick fewer)
-
-news_watch:
-  # Feeds and the free pre-filter (no model): used by digest highlights now and by live alerts later
-  finnhub_general: true       # Reuters / CNBC / Bloomberg market and world news
-  finnhub_company: true       # company news for each watchlist ticker
-  candidates_max: 40          # stories the model chooses highlights from (digests)
-  # live watcher: poll the feeds, and send the few strong candidates to the model (see triage:)
-  live: true
-  general_minutes: 2          # market news
-  company_minutes: 10         # each watchlist ticker's company news (in rotation)
-  candidate_max_age_minutes: 45  # only headlines this fresh can become instant alerts
-  min_window_hours: 12        # a digest covers news since the previous digest, within these bounds
-  max_window_hours: 72
-  skip_sources: [SeekingAlpha] # opinion-heavy
-  # ranked lower (not dropped): outlets and phrasings that are mostly opinion or clickbait
-  low_quality_sources: [fool.com, Motley Fool, Simply Wall St, Benzinga, 24/7 Wall St, Zacks, InvestorPlace,
-                        GuruFocus, Kalkine, MarketBeat, Insider Monkey, TipRanks]
-  clickbait_patterns:
-    - "(?i)here'?s (why|what|how)|\\bshould you\\b|\\bis it (a|too late)|could (soar|double|triple)|millionaire|whopping|buy now|\\bhow investors may\\b|\\?$"
-  impact_patterns:            # company events that tend to move a stock
-    - '(?i)\b(acquir\w*|merger|takeover|buyout|bankrupt\w*|chapter 11|FDA|recall|guidance|outlook|profit warning|downgrade[sd]?|investigation|probe|antitrust|lawsuit|settle\w*|resign\w*|steps? down|ousted|halt\w*|layoffs?|job cuts|buyback|dividend|beats?|miss(es|ed)?|record (revenue|profit)|SEC)\b'
-  macro_patterns:             # market-wide topics
-    - '(?i)\b(Fed|FOMC|Powell|central bank|rate (cut|hike)s?|interest rates?|inflation|CPI|PPI|jobs report|payrolls|unemployment|GDP|recession|tariffs?|trade (war|deal)|sanctions?|oil prices?|OPEC|Treasur(y|ies)|bond yields?|default|shutdown|war|invasion|missile|ceasefire|stimulus|sell-?off|stocks? (fall|slide|drop|rally|surge))\b'
-
-watch:
-  # The always-on watcher (`main.py watch`)
-  etfs: [SPY, QQQ, IWM, DIA, SMH, XLK, XLF, XLE, XLV, XLI]  # market and sector gauges, streamed with the watchlist
-  stream_limit: 50            # Finnhub free tier: max symbols on the live trade stream; the rest are polled
-  macro:                      # not on Finnhub's free tier: polled from yfinance
-    "^VIX": VIX
-    "ES=F": S&P 500 futures
-    "NQ=F": Nasdaq-100 futures
-  poll_minutes: {regular: 5, extended: 10, closed: 30}   # macro and overflow polling, by US session
-  extended_fallback_minutes: 10  # pre/after-hours: if the stream is silent this long, read yfinance 5-min bars
-  persist_seconds: 60         # how often changed live quotes and the heartbeat are written (the Pi runs from an SD card)
-  save_bars: false            # also store 1-minute bars in bars_1m (nothing reads them yet; off to spare the SD card)
-  bar_retention_days: 10      # stored 1-minute bars are deleted after this many days
-  # daily cleanup by the watcher, so the SD card never fills up
-  news_retention_days: 90     # stored headlines (ones a digest highlighted are kept)
-  report_retention_days: 60   # HTML reports and dry-run packets (latest.html is kept)
-  log_max_mb: 5               # cron.log / watchdog.log are cut to their last 1 MB above this (pipeline.log rotates daily, 30 days)
-
-alerts:
-  # Instant price alerts from the watcher. Aim: "only serious", about 0-3 a day.
-  mode: live                  # shadow = log what would be sent; live = send to Telegram
-  check_seconds: 30
-  # Stocks and sector ETFs: thresholds scale with each symbol's own volatility
-  stock_window_minutes: 15
-  stock_window_pct: 3.0       # a 15-minute move must be at least this big ...
-  stock_window_sigma: 4.0     # ... and at least this many times the symbol's normal 15-minute move
-  stock_day_pct: 5.0          # change since the previous close at least this big ...
-  stock_day_atr: 2.5          # ... and at least this many times its average daily range (ATR)
-  ext_pct: 5.0                # pre-market / after-hours change vs the previous close ...
-  ext_atr: 2.0                # ... and at least this many times its average daily range
-  # Market-wide
-  index_symbols: [SPY, QQQ]
-  index_window_pct: 1.2       # SPY or QQQ moving this much within stock_window_minutes
-  index_day_pct: 2.5          # ... or this much since the previous close
-  vix_jump_pct: 20            # VIX up this much since its previous close
-  futures_pct: 2.0            # S&P or Nasdaq futures, outside US trading hours
-  crash_pct: 3.0              # an index or futures DOWN this much: critical, comes through quiet hours
-  # Delivery
-  quiet_hours: {start: "23:00", end: "07:00", timezone: Europe/Prague}   # only critical alerts get through
-  cooldown_minutes: 60        # a sudden move on the same symbol and direction alerts again only after this ...
-  escalation_factor: 1.5      # ... or sooner if it grows this many times bigger; day-level moves alert once a day
-  daily_budget: 6             # after this many alerts in a (Prague) day, only critical ones go out
-
-triage:
-  # The model judges breaking-news candidates and explains price alerts (Sonnet: llm.model)
-  enabled: true
-  min_interval_minutes: 3     # candidates are batched: at most one call per this many minutes ...
-  max_calls_per_hour: 6       # ... and hard caps; over them, news waits for the next digest
-  max_calls_per_day: 40
-  max_items_per_call: 10
-  alert_min_impact: 4         # 1-5: only 4 (significant) and 5 (major) become instant alerts
-  follow_up_minutes: [5, 15, 30, 60]  # after a price alert: look for news that explains it

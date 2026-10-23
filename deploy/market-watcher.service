@@ -1,9 +1,9 @@
 # systemd unit for the always-on market watcher on the Raspberry Pi.
 # Install:  sudo cp deploy/market-watcher.service /etc/systemd/system/
 #           sudo systemctl daemon-reload && sudo systemctl enable --now market-watcher
-# Logs:     journalctl -u market-watcher -f     (and logs/pipeline.log, logs/cron.log)
+# Logs:     journalctl -u market-watcher -f     (the watcher writes no log files of its own)
 [Unit]
-Description=Market watcher: live prices, alerts, news triage, Telegram commands and digests
+Description=Market watcher: alerts on unusual market moves, Claude news digests, Telegram commands
 After=network-online.target
 Wants=network-online.target
 
@@ -11,12 +11,12 @@ Wants=network-online.target
 Type=simple
 User=boobogo
 WorkingDirectory=/home/boobogo/investment
-# secrets: FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN
+# secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN
 EnvironmentFile=/home/boobogo/investment/.env
 Environment=TZ=Europe/Prague
 Environment=PATH=/home/boobogo/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/boobogo/.local/bin/uv run --frozen main.py watch
-# the watcher stops cleanly on SIGTERM (saves quotes, cancels its tasks)
+# the watcher stops cleanly on SIGTERM (cancels its tasks; a Claude call in progress is dropped)
 TimeoutStopSec=30
 Restart=always
 RestartSec=30

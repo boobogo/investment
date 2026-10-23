@@ -7,16 +7,13 @@ with zoneinfo and compared in UTC.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from pipeline.config import DigestTime
+from pipeline.config import DigestTime, TimeWindow
 
 NY = ZoneInfo("America/New_York")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-# US equity sessions, New York time
-PRE_OPEN, REGULAR_OPEN, REGULAR_CLOSE, POST_CLOSE = time(4, 0), time(9, 30), time(16, 0), time(20, 0)
 
 
 def _hhmm(s: str) -> time:
@@ -39,9 +36,9 @@ def occurrences(entry: DigestTime, start_utc: datetime, end_utc: datetime) -> li
     return out
 
 
-def next_occurrence(entry: DigestTime, after_utc: datetime) -> datetime:
+def next_occurrence(entry: DigestTime, after_utc: datetime) -> datetime | None:
     found = occurrences(entry, after_utc + timedelta(microseconds=1), after_utc + timedelta(days=8))
-    return found[0]
+    return found[0] if found else None
 
 
 def last_occurrence(entry: DigestTime, now_utc: datetime) -> datetime | None:
@@ -49,37 +46,20 @@ def last_occurrence(entry: DigestTime, now_utc: datetime) -> datetime | None:
     return found[-1] if found else None
 
 
-def us_session(now_utc: datetime) -> str:
-    """'pre' | 'regular' | 'post' | 'closed' from the New York clock (holidays are checked separately)."""
-    ny = now_utc.astimezone(NY)
-    if ny.weekday() >= 5:
-        return "closed"
-    t = ny.time()
-    if PRE_OPEN <= t < REGULAR_OPEN:
-        return "pre"
-    if REGULAR_OPEN <= t < REGULAR_CLOSE:
-        return "regular"
-    if REGULAR_CLOSE <= t < POST_CLOSE:
-        return "post"
-    return "closed"
+def in_window(now_utc: datetime, w: TimeWindow) -> bool:
+    """True if the local time in the window's zone is within [start, end) on one of its days.
+
+    A window may cross midnight; its day is the day it started on."""
+    local = now_utc.astimezone(ZoneInfo(w.timezone))
+    a, b, t = _hhmm(w.start), _hhmm(w.end), local.time()
+    if a <= b:
+        return a <= t < b and DAYS[local.weekday()] in w.days
+    if t >= a:
+        return DAYS[local.weekday()] in w.days
+    return t < b and DAYS[(local.weekday() - 1) % 7] in w.days
 
 
-def futures_open(now_utc: datetime) -> bool:
-    """CME equity-index futures: Sunday 18:00 to Friday 17:00 New York time, with a daily 17:00-18:00 break.
-    (Exchange holidays are not modelled; a stale quote on a holiday just doesn't move.)"""
-    ny = now_utc.astimezone(NY)
-    t, wd = ny.time(), ny.weekday()  # Monday = 0
-    if wd == 5 or (wd == 4 and t >= time(17, 0)) or (wd == 6 and t < time(18, 0)):
-        return False
-    return not (time(17, 0) <= t < time(18, 0))
-
-
-def ny_date(now_utc: datetime) -> date:
-    return now_utc.astimezone(NY).date()
-
-
-def in_window(now_utc: datetime, start: str, end: str, tz: str) -> bool:
-    """True if the local time in `tz` is within [start, end); the window may cross midnight."""
-    local = now_utc.astimezone(ZoneInfo(tz)).time()
-    a, b = _hhmm(start), _hhmm(end)
-    return a <= local < b if a <= b else (local >= a or local < b)
+def local_day_start(now_utc: datetime, tz: str) -> datetime:
+    """Local midnight of `now` in `tz`, in UTC (budgets and counts follow the user's local day)."""
+    zone = ZoneInfo(tz)
+    return datetime.combine(now_utc.astimezone(zone).date(), time.min, zone).astimezone(timezone.utc)

@@ -1,72 +1,41 @@
 # CLAUDE.md
 
-Daily US-stock research pipeline: Python fetches data, computes indicators, screens, and sends compact packets to Claude via `claude -p` (the user's Pro subscription) for structured verdicts; everything is logged to SQLite and summarised in an HTML report. Research aid only, no trading. **README.md** has usage, config, scheduling, Raspberry Pi and evaluation docs; this file has what a developer needs on top.
+Always-on market watcher on a Raspberry Pi: checks ~24 macro instruments (index futures, VIX, sector ETFs, yields, FX, gold, oil, Europe, Asia, bitcoin) every 15/30 minutes, sends Telegram alerts on unusual moves, and has Claude (`claude -p` with web search, the user's Pro subscription) explain big moves and write two news digests a day. Research aid only, no trading. **README.md** has usage, config, the Pi and how alerts work; this file has what a developer needs on top.
 
 ## Commands
 
 - Python 3.11+, managed with **uv only** (`uv add`, `uv run`; no pip, no manual venv).
-- `uv run pytest`: unit and whole-run tests. No network, no Claude calls (a `FakeBackend` stands in).
-- `uv run main.py run --dry-run`: real data and screening, **no Claude call**. Free; use it to check changes.
-- `uv run main.py run` (without `--dry-run`) calls Claude and **uses the user's Pro quota: ask before running it.**
-- `uv run main.py evaluate | report | indicators`: read-only, no Claude call.
-- Report screenshots for visual checks: Windows Chrome headless at `/mnt/c/Program Files/Google/Chrome/Application/chrome.exe` (`--headless=new --screenshot=...`; use a 390px iframe for phone width, since the window can't go that narrow).
+- `uv run pytest`: offline tests (fake prices, `tests/test_brain.FakeBackend` for Claude, a fake Telegram).
+- `uv run main.py check`: live prices and what would alert. Free; use it to check changes.
+- `uv run main.py digest KIND --dry-run`: the request Claude would get. Free.
+- `uv run main.py digest KIND` (without `--dry-run`) calls Claude and **uses the user's Pro quota: ask before running it.**
+- Deploy: `scripts/deploy_pi.sh` (rsync + `uv sync --frozen` + restart). Don't run `main.py watch` on the PC while the Pi runs (Telegram getUpdates conflict).
 
 ## Layout
 
-`main.py` (CLI) -> `pipeline/runner.py` orchestrates one run: `fetch` (yfinance + 5-min bars) -> `indicators` -> `news` (RSS) -> `screen` (what to send) -> `packets` -> `brain` (LLM backends, batching, retries) -> `storage` (SQLite) -> `report` (Jinja2 HTML) ; `evaluate` scores verdicts later. Config: `config/settings.yaml` + `config/tickers.yaml`, validated by pydantic in `pipeline/config.py` (`extra="forbid"`: a new setting needs a model field too). Prompt: `prompts/analyst.md`.
+`main.py` (CLI) -> `pipeline/watcher.py` (asyncio: check loop, digest schedule loop, Telegram command loop). `markets` (yfinance downloads, rolling 24h/1h moves, sigma) -> `alerts` (thresholds in sigma units, repeats, quiet hours, budget, message) ; `briefing` (Claude requests, JSON schemas, Telegram rendering) + `brain` (`claude` CLI backend, retries) ; `state` (JSON file) ; `commands`, `clock`, `telegram`, `config`. Config: `config/settings.yaml`, validated by pydantic in `pipeline/config.py` (`extra="forbid"`: a new setting needs a model field too). Prompts: `prompts/digest.md`, `prompts/explain.md`.
 
 ## Decisions to keep (and why)
 
-- **Claude CLI flags** (`brain.ClaudeCLIBackend`): `--system-prompt` (replaces Claude Code's ~29k-token default prompt; ~1k instead), `--tools ""`, `--strict-mcp-config`, `--safe-mode`, `--no-session-persistence`, `--json-schema`. **Never `--bare`**: it ignores the Pro login. `ANTHROPIC_API_KEY` must be unset, or the CLI bills the API.
-- **Model is pinned** (`llm.model: claude-sonnet-5-5`), not an alias, so evaluation never mixes models silently. Opus is a one-line switch.
-- **Output schema exists twice** (pydantic `Verdict` + JSON schema in `schema.py`); a test keeps them in sync. Item counts are checked in pydantic, not in the JSON schema.
-- **Packets never contain nulls**: missing values go into `missing`. Units are explained once in `prompts/analyst.md`, so **a new packet field must be documented in the prompt**.
-- **Slots:** runs default to `manual`; only the cron wrapper passes `--slot morning|afternoon`, and each scheduled slot runs once per day. (Deriving the slot from the clock was rejected: a 1am manual run would have consumed the morning slot.)
-- **Price cache:** the full 2-year window is replaced each run (consistent split/dividend adjustment), but a download that ends earlier never overwrites newer cached bars; a session missing from Yahoo's daily data is rebuilt from 5-minute bars (Yahoo shows an empty latest close for hours after 20:00 New York time); unfinished sessions are dropped.
-- **News:** yfinance's news endpoint returns 404, so Yahoo RSS + Google News RSS are used, with relevance filters, story-level dedup (shared content words) and per-ticker `aliases` / `news_exclude`.
-- **Screen:** extremes (RSI 80/20, z20 2.5, new 52-week high/low) were requested by the user, who wants an early look before big moves. Extended-hours moves (after-hours in the morning run, pre-market in the afternoon) serve the same goal. Fresh news only triggers together with a move (otherwise every mega-cap is sent daily). `trigger_log` stops the same condition re-sending.
-- **Evaluation:** excess return vs SPY, the latest verdict per (ticker, market date), and baselines on the same dates. The user wants to know whether Claude has an edge, so keep the comparisons honest (survivorship, overlap and selection caveats are in the README).
-- **Report:** bullish = blue, bearish = red (colorblind-safe, not green/red), and every badge has a glyph + word. Model and headline text is HTML-escaped (autoescape).
+- **Redesign of 2026-10-23** (user's request): the earlier version (Finnhub price stream of watchlist stocks, keyword-filtered news feeds + Claude triage, daily stock screening with indicators, SQLite, HTML reports, verdict evaluation) was removed. The news feeds missed the cause of the 2026-10-22 AI sell-off (5 "no news found" follow-ups) while a fitting headline was in the database; the user prefers Claude with web search for news and Claude (not local indicators) for overbought/oversold names. The old code is in git history (commit 052f642 and earlier); the Pi's old database, reports and logs are backed up on the PC in `data/pi-backup-2026-10-23.tar.gz` (the PC's own old database, reports and logs were deleted).
+- **Claude CLI flags** (`brain.ClaudeCLIBackend`): `--system-prompt` (replaces Claude Code's ~29k-token default prompt), `--tools WebSearch --allowedTools WebSearch`, `--strict-mcp-config`, `--safe-mode`, `--no-session-persistence`, `--json-schema`. **Never `--bare`**: it ignores the Pro login. `ANTHROPIC_API_KEY` is removed from the CLI's environment, or it bills the API.
+- **Model is pinned** (`claude.model: claude-sonnet-5-5`), not an alias.
+- **Claude cap:** `claude.daily_calls: 4` per Prague day; scheduled digests are reserved first (weekday 2, Sunday 1), the rest serve alert explanations and `/digest`. Explanations: one per 2 h burst, skipped when a digest is due within 45 min. Calls are serialised by a lock.
+- **Thresholds in sigma units** (typical daily move from 250 daily closes), not fixed %, so one setting fits the S&P and oil. Day 2.5 / hour 2.0 were chosen by replaying 60 days of 5-minute bars (~5 alerts/week, catches the Oct 22 sell-off at 19:00 Prague; 3.0 missed it). Critical (passes quiet hours) only for `alerts.critical_symbols`.
+- **Rolling windows instead of exchange calendars:** 24h = last price vs the last price at least 24 h before it (previous close across closures); 1h needs a reference bar within 75 minutes before the target, so an open's overnight gap is never a "1h move". Quotes older than 45 min are "closed" and never alert (otherwise yesterday's move re-alerts the next day).
+- **Natural gas left out:** Yahoo's `=F` front-month series jump at contract rolls (big for NG), which would fake 24h moves. Oil rolls are small relative to its sigma.
+- **SD card:** no database; `data/state.json` (atomic replace, lists pruned after 8 days) is written at each check (heartbeat) and on events; logs only to the journal (capped at 200 MB on the Pi). `main.py digest`/`watchdog` open the state read-only (the service owns it); the watchdog keeps its flag in `data/watchdog.json`.
+- **Digest numbers:** the snapshot at the end of each digest comes from our data, and the prompt tells Claude to use it for current levels; Claude's stories must come from searches inside the window, with outlet and time.
 
 ## Conventions
 
-- Flat modules, one per pipeline stage; comments explain *why*, not what.
-- Tests build temp databases from `tests/fixtures/*.csv` (real AAPL/SPY history); `tests/test_runner.py` has the whole-run helpers.
-- Shared knobs belong in `settings.yaml`, not constants.
+- Flat modules, comments explain *why*, not what. Shared knobs belong in `settings.yaml`, not constants.
+- Telegram text is HTML: everything from outside (Claude's text, instrument names) goes through `telegram.esc`.
+- Times: every schedule in its own zone with zoneinfo (`clock.py`); tests cover the 2026-10-25 EU and 2026-11-01 US clock changes.
 
-## Redesign in progress (started 2026-10-18): always-on watcher on the Raspberry Pi
+## Status (2026-10-23)
 
-Plan: `~/.claude/plans/pasted-content-id-f057-project-proud-sedgewick.md`. Goal: Pi 4 (`boobogo@192.168.0.55`, aarch64, Debian 12; SSH key login works) runs one systemd service that streams prices (Finnhub websocket, max ~50 symbols on the free tier), sends instant Telegram alerts for unusual moves and pre-filtered breaking news (Claude Sonnet triage, capped 6/h and 40/day), and schedules digests (07:30 Prague, 09:00 New York, Sunday 19:00 Prague) with summary + HTML file. Quiet hours 23:00-07:00 Prague (crashes only); extremes stay in digests. Secrets in `.env`: FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (loaded by `config.load_env`; never print them).
-
-- Step 1 done: `.env` loader, `pipeline/telegram.py`, `pipeline/finnhub.py`, watcher tables in `storage.py`, digests delivered to Telegram (`report.TelegramDeliverer`, `report --send`, `telegram-test`).
-- Step 2 done: digest extras in `pipeline/digest.py` (news highlights picked by one Sonnet call from pre-filtered candidates, `prompts/highlights.md`; Finnhub earnings calendar with Yahoo's date shown when they disagree; weekly movers; held alerts), `pipeline/newswatch.py` (Finnhub feeds + free pre-filter score), `pipeline/clock.py` (DST-safe schedule, US session, quiet-hours window; tests cover the 2026-10-25/11-01 changes). Slots are now morning | preopen | weekly | manual; the weekly slot skips the stock review.
-- News pre-filter lessons: Finnhub company news includes general market pieces (keep only items naming the company); "any member" story matching chains hundreds of headlines into giant stories (digests compare with the lead only); items about different watchlist companies are never one story; law-firm lawsuit ads are filtered in `news.skip_title_patterns`.
-- Step 3 done (code): `pipeline/live.py` (trades -> 1-minute bars; window changes refuse overnight/halt gaps), `finnhub.TradeStream` (websocket, reconnect with backoff, key never logged), `pipeline/watcher.py` (`main.py watch [--minutes N] [--shadow]`): stream universe = first 2 ETFs + watchlist + other ETFs (cap 50, rest polled via /quote), session from Finnhub market-status (holidays) else NY clock, VIX/ES=F/NQ=F via yfinance `fast_info`, yfinance 5-min fallback when the stream is silent in pre/post, quotes -> `live_quotes`, bars -> `bars_1m`, heartbeat in `watch_state`.
-- Previous close = last daily bar before today's NY date from our own history (refreshed daily for all streamed symbols, no fundamentals). Finnhub /quote `pc` lagged a day over the weekend (Thursday instead of Friday), so it is only a fallback.
-- Still to verify in a live US session: trade flow on the stream, and whether Finnhub streams pre-market/after-hours trades (if not, the yfinance fallback covers it).
-- Step 4 done (shadow mode): `pipeline/detect.py` (pure detectors; thresholds = max(fixed %, multiple of the symbol's own sigma/ATR from daily history)), `pipeline/alerts.py` (policy: repeats suppressed by key symbol:kind:direction - cooldown for 15-min bursts, once per NY day for level moves, a "day" move after an "ext" alert within 24h is the same story; quiet hours 23-07 Prague hold all but critical; /mute; daily budget 6; shadow vs live via `alerts.mode`), events in `price_events`, decisions in `alerts` (recorded at event time). `main.py alerts [--days N]` lists them; `main.py alerts --estimate` replays ~60 days of 5-min bars: 0.20 alerts per trading day (12 in 59 days; all earnings moves, big QQQ days, sudden drops) - regular hours only.
-- Lessons: yfinance `fast_info` kept Friday's previous close after the Sunday futures reopen, so VIX/futures quotes come from timestamped 5-min bars (`watcher.macro_quote`) and are ignored when older than 30 min; futures are only checked while CME trades (`clock.futures_open`).
-- Step 5 done: `pipeline/newsdesk.py` inside the watcher polls Finnhub market news every 2 min (minId) and watchlist company news in rotation, stores everything in `news_items`, and queues only strict candidates (`Prefilter.is_breaking_candidate`: company named in the headline + impact word, or top-outlet market news + market topic; clickbait and low-quality outlets excluded; same story as one judged in 24h skipped). `pipeline/triage.py` + `prompts/triage.md`: one Sonnet call per batch (>= 3 min apart, capped 6/h and 40/day counted from llm_calls purpose 'triage' under a daily 'watch' run). Impact >= 4 with new information -> news alert through the same quiet/mute/budget gate (market-wide impact 5 = critical). Price alerts (sent or shadow) get follow-ups at +5/15/30/60 min; an explanation or "no news found" goes as a reply in the alert's thread; serious news about a stock with an open price alert also goes into that thread.
-- Measured: ~7 strict candidates/day before triage (most market-wide Reuters/CNBC items that Claude rates 1-3); one real triage call = 2.6k in / 0.4k out tokens.
-- Every watcher loop survives a failed round (logs and continues); a crashed task would stop the watcher, and systemd restarts it.
-- Step 6 done: `pipeline/commands.py` (/status /mute /unmute /digest /why /news /alerts /report /watchlist /help; only TELEGRAM_CHAT_ID; commands older than 10 min ignored) answered by the watcher's long-poll loop (offset in watch_state); the watcher schedules digests itself (`run_due_digests`: 3 h grace, holiday skip for preopen, max 2 tries) by running `scripts/run_pipeline.sh <slot>` as a subprocess; /why = a manual full run of one ticker with `deliver=False`, replied as a card; packets get a `live` field from `live_quotes`; startup notice at most hourly; `main.py watchdog` for cron.
-- Step 7 done (2026-10-19): deployed to the Pi at `~/investment` (uv 0.13.1, Claude Code 2.1.302 arm64, all tests pass there). systemd unit `market-watcher` (`deploy/market-watcher.service`, Restart=always, EnvironmentFile=.env; survived a SIGKILL test), watchdog in the Pi's crontab every 5 min. The Pi's `data/market.db` is now the live database (copied from the PC on 2026-10-19). Update code with `scripts/deploy_pi.sh` (never touches the Pi's data/logs/reports/.env). Don't run `main.py watch` on the PC while the Pi runs (Telegram getUpdates conflict).
-- SD card (2026-10-19): the Pi runs from an SD card, so the watcher writes little: changed quotes + heartbeat once a minute in one transaction (`storage.save_live`), 1-minute bars off (`watch.save_bars`), SQLite `synchronous=NORMAL` (WAL stays crash-safe). Digests judge live-quote freshness by the watcher's heartbeat (`storage.watcher_alive`), since unchanged quotes are not rewritten. Raspberry Pi Connect was turned off on the Pi (`rpi-connect off` + user-level mask of `rpi-connect-wayvnc`): its screen sharing crash-looped every 5 s on the headless Pi (`rpi-connect on` / `systemctl --user unmask rpi-connect-wayvnc` to undo).
-- Claude login on the Pi works (`CLAUDE_CODE_OAUTH_TOKEN` in the Pi's `.env`, verified 2026-10-19).
-- 2026-10-19: the user chose to skip the shadow week: `alerts.mode: live` (code default stays `shadow`). The watcher's daily `housekeeping()` deletes headlines > 90 days (highlighted ones stay; FK from digest_highlights), reports > 60 days (latest.html kept) and trims cron.log/watchdog.log > 5 MB; the Pi's journald is capped at 200 MB (`/etc/systemd/journald.conf.d/size.conf`).
-- Watch next: real alert volume in the first live US sessions (`/alerts`, `main.py alerts`); thresholds are in `alerts:` if it is too noisy or too quiet. Still unverified: whether Finnhub streams pre/after-hours trades.
-
-## Status (2026-10-16)
-
-- All 7 planned build steps are done; 101 tests pass.
-- **Not scheduled yet:** the user is testing manually on this PC (WSL) and may move to a Raspberry Pi (Pi 4 with 4 GB or Pi 5, 64-bit OS; see the README).
-- **Git:** pushed to the private GitHub repo `boobogo/investment` (branch `main`, first commit 2026-10-19).
-- First real verdicts were logged 2026-10-16 (as of the 2026-10-15 close). They mature for 5-day scoring around 2026-10-22 and for 20-day around 2026-11-12.
-
-### Open ideas / next steps
-
-- Run manually for 1-2 weeks; tune the `screen:` thresholds (e.g. RSI 75/25 if 80/20 is too quiet); add real holdings (`held`, `cost_basis`); grow to 50-100 tickers; then schedule (README: Task Scheduler snippet or crontab).
-- Token use: a packet is ~700-1000 tokens and a verdict ~450 output tokens. If that matters, send a shared header per batch instead of repeating keys (~40% fewer input tokens), use 3 headlines instead of 5, or set effort `medium`.
-- Most verdicts are `neutral` (the prompt prioritises calibration). Revisit only once evaluation data exists.
-- Same-story headline dedup still misses rewordings that only share a brand name (e.g. "Bee" devices); improving it would need more than titles.
-- Telegram and email delivery are stubs (`report.Deliverer`); the Anthropic API backend (`llm.backend: api`) is written but untested (no API key).
+- Deployed on the Pi (`boobogo@192.168.0.55`, Debian 12, aarch64) at `~/investment`, service `market-watcher`, alerts live; watchdog cron every 15 min. Claude login via `CLAUDE_CODE_OAUTH_TOKEN` in the Pi's `.env` (works since 2026-10-19). `FINNHUB_API_KEY` in `.env` is no longer used (the user wants it kept).
+- Real Claude call verified 2026-10-23 on the Pi (manual digest, web search + JSON schema): ok in 100 s, sent to Telegram, well sourced, but ~5,500 characters (2 messages), so the prompt now asks for under ~2,500. The CLI doesn't report WebSearch in `server_tool_use`, so calls log `num_turns` instead.
+- Watch next: alert volume (~5/week expected), whether Claude's "stretched stocks" evidence is current and sourced (the test found one name, without an RSI figure), digest length after the prompt change. Thresholds are in `alerts:`, prompts in `prompts/`.
+- Git: private repo `boobogo/investment` (branch `main`).

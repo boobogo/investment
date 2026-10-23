@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from pipeline import clock
-from pipeline.config import DigestsCfg
+from pipeline.config import DigestsCfg, TimeWindow, WatchCfg
 
 CFG = DigestsCfg()
 
@@ -49,24 +49,42 @@ def test_occurrences_in_range():
 
 
 @pytest.mark.parametrize(
-    "when,session",
+    "when,open_",
     [
-        ("2026-10-23T12:00", "pre"),  # 08:00 New York
-        ("2026-10-23T13:30", "regular"),  # 09:30 New York (summer)
-        ("2026-11-02T14:29", "pre"),  # 09:29 New York (winter)
-        ("2026-11-02T14:30", "regular"),
-        ("2026-10-23T20:30", "post"),  # 16:30 New York
-        ("2026-10-24T15:00", "closed"),  # Saturday
+        ("2026-10-23T06:59", False),  # 08:59 Berlin (summer)
+        ("2026-10-23T07:00", True),  # 09:00 Berlin: Xetra opens
+        ("2026-10-23T15:29", True),  # 17:29 Berlin
+        ("2026-10-23T16:00", True),  # 12:00 New York
+        ("2026-10-23T19:59", True),  # 15:59 New York
+        ("2026-10-23T20:00", False),  # 16:00 New York: closed
+        ("2026-10-26T13:30", True),  # mismatch week: 14:30 Berlin (winter) and 09:30 New York (summer)
+        ("2026-10-26T15:30", True),  # 16:30 Berlin
+        ("2026-10-26T20:00", False),  # 16:00 New York
+        ("2026-10-24T12:00", False),  # Saturday
     ],
 )
-def test_us_session(when, session):
-    assert clock.us_session(utc(when)) == session
+def test_market_hours(when, open_):
+    hours = WatchCfg().market_hours
+    assert any(clock.in_window(utc(when), w) for w in hours) == open_
 
 
 def test_quiet_hours_cross_midnight_and_dst():
-    quiet = lambda s: clock.in_window(utc(s), "23:00", "07:00", "Europe/Prague")  # noqa: E731
+    window = TimeWindow(start="23:00", end="07:00", timezone="Europe/Prague")
+    quiet = lambda s: clock.in_window(utc(s), window)  # noqa: E731
     assert quiet("2026-10-24T21:00")  # 23:00 CEST
     assert not quiet("2026-10-25T21:30")  # 22:30 CET (after the change, 21:30 UTC is no longer 23:30)
     assert quiet("2026-10-25T22:00")  # 23:00 CET
     assert quiet("2026-10-26T05:59")  # 06:59 CET
     assert not quiet("2026-10-26T06:00")  # 07:00 CET
+
+
+def test_window_days_follow_the_start_day():
+    fri_night = TimeWindow(start="22:00", end="02:00", timezone="Europe/Prague", days=["fri"])
+    assert clock.in_window(utc("2026-10-23T21:00"), fri_night)  # Friday 23:00
+    assert clock.in_window(utc("2026-10-23T23:30"), fri_night)  # Saturday 01:30, still Friday's window
+    assert not clock.in_window(utc("2026-10-24T21:00"), fri_night)  # Saturday 23:00
+
+
+def test_local_day_start():
+    assert clock.local_day_start(utc("2026-10-23T12:00"), "Europe/Prague") == utc("2026-10-22T22:00")
+    assert clock.local_day_start(utc("2026-10-26T12:00"), "Europe/Prague") == utc("2026-10-25T23:00")

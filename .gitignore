@@ -13,5 +13,4 @@ wheels/
 # Pipeline runtime output
 data/
 logs/
-reports/
 .env
